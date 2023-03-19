@@ -1,0 +1,11 @@
+[package]
+name = "p2p_pingpong"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+futures = "0.3.27"
+libp2p = { version = "0.51.1", features = ["tcp", "tokio", "mplex", "yamux", "noise"] }
+tokio = { version = "1.26.0", features = ["full"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.16"
