@@ -1,0 +1,10 @@
+[package]
+name = "esys_entropy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libp2p = { version = "0.51.1", features = ["kad", "macros", "noise", "tcp", "yamux", "rendezvous", "tokio", "identify"] }
+tokio = { version = "1.26.0", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.16"
