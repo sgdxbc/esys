@@ -5,9 +5,13 @@ use libp2p::{
     futures::StreamExt,
     identify,
     identity::Keypair,
-    kad::{store::MemoryStore, Kademlia, KademliaEvent, QueryResult},
+    kad::{
+        record::Key, store::MemoryStore, GetRecordOk, Kademlia, KademliaEvent, QueryResult, Quorum,
+        Record,
+    },
     multiaddr,
-    swarm::{NetworkBehaviour, SwarmEvent, THandlerErr},
+    multihash::Multihash,
+    swarm::{AddressScore, NetworkBehaviour, SwarmEvent, THandlerErr},
     Multiaddr, PeerId, Swarm,
 };
 use tokio::{
@@ -37,7 +41,6 @@ impl App {
         name: impl ToString,
         transport: transport::Boxed<(PeerId, StreamMuxerBox)>,
         keypair: Keypair,
-        addr: impl TryInto<Multiaddr>,
     ) -> (JoinHandle<Swarm<Self>>, AppControl) {
         let id = PeerId::from_public_key(&keypair.public());
         let app = Self {
@@ -48,9 +51,6 @@ impl App {
             kad: Kademlia::new(id, MemoryStore::new(id)),
         };
         let mut swarm = Swarm::with_tokio_executor(transport, app, id);
-        swarm
-            .listen_on(addr.try_into().map_err(|_| ()).unwrap())
-            .unwrap();
         let mut ingress = mpsc::unbounded_channel();
         let control = AppControl { ingress: ingress.0 };
         let name = name.to_string();
@@ -105,7 +105,25 @@ impl AppControl {
         async move { exited.1.await.unwrap() }
     }
 
-    pub fn serve_kad(&mut self) {
+    pub fn listen_on(&self, addr: Multiaddr) {
+        self.ingress(move |swarm| {
+            swarm.listen_on(addr).unwrap();
+        });
+    }
+
+    pub fn serve_listen(
+        &self,
+        mut into_external: impl FnMut(&Multiaddr) -> Multiaddr + Send + 'static,
+    ) {
+        let _ = self.subscribe(move |event, swarm| {
+            if let SwarmEvent::NewListenAddr { address, .. } = event {
+                swarm.add_external_address(into_external(address), AddressScore::Infinite);
+            }
+            ControlFlow::Continue(())
+        });
+    }
+
+    pub fn serve_kad(&self) {
         let _ = self.subscribe(|event, swarm| {
             if let SwarmEvent::Behaviour(AppEvent::Identify(identify::Event::Received {
                 peer_id,
@@ -125,7 +143,7 @@ impl AppControl {
         });
     }
 
-    pub async fn boostrap(&mut self, service: Multiaddr) {
+    pub async fn boostrap(&self, service: Multiaddr) {
         // step 1, dial boostrap service
         self.ingress({
             let service = service.clone();
@@ -170,6 +188,95 @@ impl AppControl {
             ControlFlow::Continue(())
         })
         .await;
+    }
+
+    pub async fn register(&self) {
+        let put_id = oneshot::channel();
+        self.ingress(move |swarm| {
+            let addr = &swarm.external_addresses().next().unwrap().addr;
+            tracing::debug!(peer_id = %swarm.local_peer_id(), %addr, "register");
+            let record = Record::new(swarm.local_peer_id().to_bytes(), addr.to_vec());
+            put_id
+                .0
+                .send(
+                    swarm
+                        .behaviour_mut()
+                        .kad
+                        .put_record(record, Quorum::All)
+                        .unwrap(),
+                )
+                .unwrap();
+        });
+        let put_id = put_id.1.await.unwrap();
+        self.subscribe(move |event, _| match event {
+            SwarmEvent::Behaviour(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
+                id,
+                ..
+            })) if *id == put_id => ControlFlow::Break(()),
+            _ => ControlFlow::Continue(()),
+        })
+        .await
+    }
+
+    // given a key (e.g. hash of encoded fragment), find closest peer's id and address
+    pub async fn query(&self, key: Multihash) -> Option<(PeerId, Multiaddr)> {
+        let find_id = oneshot::channel();
+        self.ingress(move |swarm| {
+            find_id
+                .0
+                .send(swarm.behaviour_mut().kad.get_closest_peers(key))
+                .unwrap()
+        });
+        let find_id = find_id.1.await.unwrap();
+        let mut get_id = None;
+        let mut peer = oneshot::channel();
+        self.subscribe({
+            let mut peer = Some(peer.0);
+            move |event, swarm| match event {
+                SwarmEvent::Behaviour(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
+                    id,
+                    result: QueryResult::GetClosestPeers(result),
+                    ..
+                })) if *id == find_id => {
+                    let Ok(result) = result else {
+                    peer.take().unwrap().send(None).unwrap();
+                    return ControlFlow::Break(());
+                };
+                    get_id = Some(
+                        swarm
+                            .behaviour_mut()
+                            .kad
+                            .get_record(Key::new(&result.peers[0].to_bytes())),
+                    );
+                    ControlFlow::Continue(())
+                }
+                SwarmEvent::Behaviour(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
+                    id,
+                    result: QueryResult::GetRecord(result),
+                    step,
+                    ..
+                })) if Some(*id) == get_id => {
+                    let result = if let Ok(GetRecordOk::FoundRecord(result)) = result {
+                        if !step.last {
+                            swarm.behaviour_mut().kad.query_mut(id).unwrap().finish();
+                        }
+                        Some((
+                            PeerId::from_bytes(&result.record.key.to_vec()).unwrap(),
+                            Multiaddr::try_from(result.record.value.clone()).unwrap(),
+                        ))
+                    } else if step.last {
+                        None
+                    } else {
+                        return ControlFlow::Continue(());
+                    };
+                    peer.take().unwrap().send(result).unwrap();
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        })
+        .await;
+        peer.1.try_recv().unwrap()
     }
 }
 
