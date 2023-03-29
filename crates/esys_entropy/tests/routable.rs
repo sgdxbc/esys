@@ -16,7 +16,7 @@ use tokio::{
 };
 
 #[tokio::test(flavor = "multi_thread")]
-async fn get_all_peers() {
+async fn query_all_peers() {
     tracing_subscriber::fmt::init();
 
     let server_keypair = Keypair::generate_ed25519();
@@ -30,7 +30,7 @@ async fn get_all_peers() {
     server_control.serve_kad();
     server_control.listen_on("/memory/1".parse().unwrap());
 
-    let n = 200;
+    let n = 400;
     let register_barrier = Arc::new(Barrier::new(n));
     let exit_barrier = Arc::new(Barrier::new(n + 1));
     let peer_ids = Arc::new(Mutex::new(Vec::new()));
@@ -59,7 +59,6 @@ async fn get_all_peers() {
 
                 peer_ids.lock().await.push(peer_id);
                 if register_barrier.wait().await.is_leader() {
-                    sleep(Duration::from_secs(1)).await;
                     for peer_id in &*peer_ids.lock().await {
                         tracing::info!(%peer_id, "query");
                         let result = control.query((*peer_id).into()).await;
@@ -79,7 +78,3 @@ async fn get_all_peers() {
         peer.await.unwrap()
     }
 }
-
-// async fn reach_all(control: &AppControl, peer_ids: &[PeerId]) {
-//     let mut i = 0;
-// }

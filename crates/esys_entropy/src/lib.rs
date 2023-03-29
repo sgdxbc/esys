@@ -117,7 +117,11 @@ impl AppControl {
     ) {
         let _ = self.subscribe(move |event, swarm| {
             if let SwarmEvent::NewListenAddr { address, .. } = event {
-                swarm.add_external_address(into_external(address), AddressScore::Infinite);
+                let address = into_external(address);
+                swarm.add_external_address(address.clone(), AddressScore::Infinite);
+                // not work
+                // let local_id = *swarm.local_peer_id();
+                // swarm.behaviour_mut().kad.add_address(&local_id, address);
             }
             ControlFlow::Continue(())
         });
