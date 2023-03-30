@@ -115,36 +115,38 @@ impl AppControl {
         &self,
         mut into_external: impl FnMut(&Multiaddr) -> Multiaddr + Send + 'static,
     ) {
-        let _ = self.subscribe(move |event, swarm| {
+        let s = self.subscribe(move |event, swarm| {
             if let SwarmEvent::NewListenAddr { address, .. } = event {
                 let address = into_external(address);
-                swarm.add_external_address(address.clone(), AddressScore::Infinite);
+                swarm.add_external_address(address, AddressScore::Infinite);
                 // not work
                 // let local_id = *swarm.local_peer_id();
                 // swarm.behaviour_mut().kad.add_address(&local_id, address);
             }
             ControlFlow::Continue(())
         });
+        drop(s);
     }
 
     pub fn serve_kad(&self) {
-        let _ = self.subscribe(|event, swarm| {
+        let s = self.subscribe(|event, swarm| {
             if let SwarmEvent::Behaviour(AppEvent::Identify(identify::Event::Received {
                 peer_id,
                 info,
             })) = event
             {
                 swarm.behaviour_mut().kad.add_address(
-                    &peer_id,
+                    peer_id,
                     info.listen_addrs
                         .iter()
-                        .find(|addr| is_global(*addr))
+                        .find(|addr| is_global(addr))
                         .unwrap()
                         .to_owned(),
                 );
             }
             ControlFlow::Continue(())
         });
+        drop(s);
     }
 
     pub async fn boostrap(&self, service: Multiaddr) {
@@ -285,7 +287,7 @@ impl AppControl {
 }
 
 fn is_global(addr: &Multiaddr) -> bool {
-    match addr.iter().nth(0) {
+    match addr.iter().next() {
         Some(multiaddr::Protocol::Memory(_)) => true,
         Some(multiaddr::Protocol::Ip4(addr)) => !addr.is_private() && !addr.is_loopback(),
         _ => false,
