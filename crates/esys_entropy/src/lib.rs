@@ -6,8 +6,8 @@ use libp2p::{
     identify,
     identity::Keypair,
     kad::{
-        record::Key, store::MemoryStore, GetRecordOk, Kademlia, KademliaEvent, QueryResult, Quorum,
-        Record,
+        kbucket, record::Key, store::MemoryStore, GetRecordOk, Kademlia, KademliaEvent,
+        QueryResult, Quorum, Record,
     },
     multiaddr,
     multihash::Multihash,
@@ -194,6 +194,19 @@ impl AppControl {
             ControlFlow::Continue(())
         })
         .await;
+
+        // disabled for now, because when `remove_peer` the connection is closed and service peer cannot provide local
+        // peer's information for further bootstraping
+        // the system should be designed in a way so that boostrap peer can proceed as a normal peer for all time. if
+        // it cannot, then we still need to workaround to readd this step, or make some more rendezvour mechanism
+
+        // step 4, remove bootstrap peer to avoid contacting it during query
+        // let remove_done = oneshot::channel();
+        // self.ingress(move |swarm| {
+        //     swarm.behaviour_mut().kad.remove_peer(&service_id.unwrap());
+        //     remove_done.0.send(()).unwrap();
+        // });
+        // remove_done.1.await.unwrap()
     }
 
     pub async fn register(&self) {
@@ -245,14 +258,25 @@ impl AppControl {
                     ..
                 })) if *id == find_id => {
                     let Ok(result) = result else {
-                    peer.take().unwrap().send(None).unwrap();
-                    return ControlFlow::Break(());
-                };
+                        peer.take().unwrap().send(None).unwrap();
+                        return ControlFlow::Break(());
+                    };
+                    // kad excludes local peer id from `GetClosestPeers` result for unknown reason
+                    // so by default, the result from closest peer itself is different from the result from other peers
+                    // add this workaround to restore a consistent result
+                    let mut closest_id = result.peers[0];
+                    if kbucket::Key::from(closest_id).distance(&kbucket::Key::from(key))
+                        > kbucket::Key::from(*swarm.local_peer_id())
+                            .distance(&kbucket::Key::from(key))
+                    {
+                        closest_id = *swarm.local_peer_id();
+                    }
+
                     get_id = Some(
                         swarm
                             .behaviour_mut()
                             .kad
-                            .get_record(Key::new(&result.peers[0].to_bytes())),
+                            .get_record(Key::new(&closest_id.to_bytes())),
                     );
                     ControlFlow::Continue(())
                 }

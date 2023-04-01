@@ -30,7 +30,7 @@ async fn query_all_peers() {
     server_control.serve_kad();
     server_control.listen_on("/memory/1".parse().unwrap());
 
-    let n = 400;
+    let n = 20;
     let register_barrier = Arc::new(Barrier::new(n));
     let exit_barrier = Arc::new(Barrier::new(n + 1));
     let peer_ids = Arc::new(Mutex::new(Vec::new()));

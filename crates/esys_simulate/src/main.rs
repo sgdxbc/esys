@@ -25,8 +25,7 @@ struct System {
     now: u32,
 
     nodes: HashMap<NodeId, Node>,
-    // [for object [for chunk {reverse map fragment => node}]]
-    objects: Vec<Vec<HashMap<FragmentId, NodeId>>>,
+    objects: Vec<Object>,
     next_node: NodeId,
     next_event: u32,
 
@@ -38,6 +37,14 @@ struct Node {
     faulty: bool,
     // each node should be responsible for at most one fragment per chunk
     fragments: HashMap<(ObjectId, ChunkId), FragmentId>,
+}
+
+#[derive(Default, Clone)]
+struct Object {
+    // cache of `len(_ for chunk in chunks if len(chunk) >= k)`
+    alive_count: u32,
+    // [{reverse map fragment => node}]
+    chunks: Vec<HashMap<FragmentId, NodeId>>,
 }
 
 type Instant = u32;
@@ -57,14 +64,14 @@ impl System {
             events: Default::default(),
             now: 0,
             nodes: Default::default(),
-            objects: vec![vec![Default::default(); config.chunk_n as _]; config.object_count as _],
+            objects: vec![Default::default(); config.object_count as _],
             next_node: 0,
             next_event: 0,
             stats: Default::default(),
             config,
         };
         for _ in 0..system.config.node_count {
-            system.add_node(&mut rng);
+            system.add_node(rng.gen_bool(system.config.faulty_rate as _));
         }
         for id in 0..system.config.object_count {
             system.add_object(id, &mut rng);
@@ -80,11 +87,11 @@ impl System {
         self.events.insert((at, id), event);
     }
 
-    fn add_node(&mut self, mut rng: impl Rng) {
+    fn add_node(&mut self, faulty: bool) {
         let id = self.next_node;
         self.next_node += 1;
         let node = Node {
-            faulty: rng.gen_bool(self.config.faulty_rate as _),
+            faulty,
             ..Default::default()
         };
         self.nodes.insert(id, node);
@@ -120,17 +127,65 @@ impl System {
         self.add_event(after, Event::Churn);
     }
 
+    fn remove_fragment(
+        &mut self,
+        object_id: ObjectId,
+        chunk_id: ChunkId,
+        fragment_id: FragmentId,
+    ) -> Option<NodeId> {
+        let object = &mut self.objects[object_id as usize];
+        if object.is_empty() {
+            return None;
+        }
+        let chunk = &mut object[chunk_id as usize];
+        if chunk.is_empty() {
+            return None;
+        }
+        let node_id = chunk.remove(&fragment_id);
+        assert!(node_id.is_some());
+
+        if (chunk.len() as u32) < self.config.chunk_k {
+            // TODO record chunk lost?
+            chunk.clear();
+        }
+
+        node_id
+    }
+
+    fn on_churn(&mut self, mut rng: impl Rng) {
+        self.stats.churn += 1;
+
+        let (exit_id, exit_node) = self.nodes.iter().choose(&mut rng).unwrap();
+        // faulty node never leave
+        // because faulty node never store anything, so does not "discard nothing" here should not make the attack even
+        // weaker
+        // if faulty node always live, it can stay in the committee until get kicked out, so it should make the attack
+        // stronger
+        if !exit_node.faulty {
+            let exit_id = *exit_id;
+            let exit_node = self.nodes.remove(&exit_id).unwrap();
+            for ((object_id, chunk_id), framgent_id) in exit_node.fragments {
+                let committee = &mut self.objects[object_id as usize][chunk_id as usize];
+                let node_id = committee.remove(&framgent_id);
+                assert_eq!(node_id, Some(exit_id));
+                if (committee.len() as u32) < self.config.fragment_k {
+                    //
+                }
+            }
+
+            self.add_node(false); // prevent increase number of faulty
+        }
+
+        self.add_churn_event(&mut rng);
+    }
+
     fn run(&mut self, mut rng: impl Rng) {
         while self.now < self.config.duration * 86400 * 365 {
             let event;
             ((self.now, _), event) = self.events.pop_first().unwrap();
             use Event::*;
             match event {
-                Churn => {
-                    self.stats.churn += 1;
-                    //
-                    self.add_churn_event(&mut rng);
-                }
+                Churn => self.on_churn(&mut rng),
             }
         }
     }
