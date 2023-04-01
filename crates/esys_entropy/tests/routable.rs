@@ -26,7 +26,7 @@ async fn query_all_peers() {
         .multiplex(YamuxConfig::default())
         .boxed();
     let (_handle, server_control) = App::run("bootstrap", transport, server_keypair);
-    server_control.serve_listen(Clone::clone);
+    server_control.serve_listen(|addr| Some(addr.clone()));
     server_control.serve_kad();
     server_control.listen_on("/memory/1".parse().unwrap());
 
@@ -48,7 +48,7 @@ async fn query_all_peers() {
                     .multiplex(YamuxConfig::default())
                     .boxed();
                 let (_handle, control) = App::run(format!("client-{i}"), transport, key_pair);
-                control.serve_listen(Clone::clone);
+                control.serve_listen(|addr| Some(addr.clone()));
                 control.serve_kad();
                 control.listen_on("/memory/0".parse().unwrap());
 

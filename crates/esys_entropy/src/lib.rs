@@ -113,15 +113,13 @@ impl AppControl {
 
     pub fn serve_listen(
         &self,
-        mut into_external: impl FnMut(&Multiaddr) -> Multiaddr + Send + 'static,
+        mut into_external: impl FnMut(&Multiaddr) -> Option<Multiaddr> + Send + 'static,
     ) {
         let s = self.subscribe(move |event, swarm| {
             if let SwarmEvent::NewListenAddr { address, .. } = event {
-                let address = into_external(address);
-                swarm.add_external_address(address, AddressScore::Infinite);
-                // not work
-                // let local_id = *swarm.local_peer_id();
-                // swarm.behaviour_mut().kad.add_address(&local_id, address);
+                if let Some(address) = into_external(address) {
+                    swarm.add_external_address(address, AddressScore::Infinite);
+                }
             }
             ControlFlow::Continue(())
         });

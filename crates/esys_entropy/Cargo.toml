@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+clap = { version = "4.2.1", features = ["derive"] }
 libp2p = { version = "0.51.1", features = ["kad", "macros", "noise", "tcp", "yamux", "tokio", "identify"] }
 tokio = { version = "1.26.0", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tracing = "0.1.37"
