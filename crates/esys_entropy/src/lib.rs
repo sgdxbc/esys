@@ -55,11 +55,15 @@ impl App {
         let control = AppControl { ingress: ingress.0 };
         let name = name.to_string();
         let handle = spawn(async move {
+            tracing::trace!("launch app event looop");
             let mut observers = Vec::new();
             loop {
                 select! {
                     action = ingress.1.recv() => {
-                        let Some(action) = action else { return swarm };
+                        let Some(action) = action else { 
+                            tracing::trace!("exit app event loop on ingress channel close");
+                            return swarm;
+                        };
                         action(&mut swarm, &mut observers);
                     }
                     event = swarm.next() => {
@@ -118,6 +122,7 @@ impl AppControl {
         let s = self.subscribe(move |event, swarm| {
             if let SwarmEvent::NewListenAddr { address, .. } = event {
                 if let Some(address) = into_external(address) {
+                    tracing::info!(%address, "add external");
                     swarm.add_external_address(address, AddressScore::Infinite);
                 }
             }
