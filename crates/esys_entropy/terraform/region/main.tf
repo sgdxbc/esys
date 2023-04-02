@@ -71,9 +71,14 @@ data "aws_ami" "ubuntu" {
   owners = ["099720109477"] # Canonical
 }
 
+variable "instance_type" {
+  type = string
+  default = "c5.2xlarge"
+}
+
 resource "aws_instance" "esys-entropy" {
   ami                    = data.aws_ami.ubuntu.id
-  instance_type          = "c5.2xlarge"
+  instance_type          = var.instance_type
   subnet_id              = resource.aws_subnet.esys-entropy.id
   vpc_security_group_ids = [resource.aws_security_group.esys-entropy.id]
   key_name               = "Ephemeral"

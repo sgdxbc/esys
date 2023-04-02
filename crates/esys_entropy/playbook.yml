@@ -1,0 +1,31 @@
+---
+- name: Common setup
+  hosts: all
+  tasks:
+  - name: Copy compiled artifact
+    ansible.builtin.copy:
+      src: ../../target/release/esys_entropy
+      dest: .
+      mode: preserve
+  - name: Increase file descriptor limit
+    become: yes
+    become_user: root
+    community.general.pam_limits:
+      domain: ubuntu
+      limit_type: soft
+      limit_item: nofile
+      value: 1048576
+- name: Start service peer
+  hosts: service
+  tasks:
+  - ansible.builtin.shell: >
+      tmux new-session -d -s esys 
+      ./esys_entropy --ip {{ inventory_hostname }} --bootstrap-service
+      || read _
+- name: Start normal peers
+  hosts: normal
+  tasks:
+  - ansible.builtin.shell: >
+      tmux new-session -d -s esys 
+      ./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }}
+      || read _
