@@ -7,7 +7,7 @@ use libp2p::{
     identity::Keypair,
     kad::{
         kbucket, record::Key, store::MemoryStore, GetRecordOk, Kademlia, KademliaEvent,
-        QueryResult, Quorum, Record,
+        PutRecordError, QueryResult, Quorum, Record,
     },
     multiaddr,
     multihash::Multihash,
@@ -60,7 +60,7 @@ impl App {
             loop {
                 select! {
                     action = ingress.1.recv() => {
-                        let Some(action) = action else { 
+                        let Some(action) = action else {
                             tracing::trace!("exit app event loop on ingress channel close");
                             return swarm;
                         };
@@ -233,8 +233,17 @@ impl AppControl {
         self.subscribe(move |event, _| match event {
             SwarmEvent::Behaviour(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
                 id,
+                result: QueryResult::PutRecord(result),
                 ..
-            })) if *id == put_id => ControlFlow::Break(()),
+            })) if *id == put_id => {
+                if let Err(err) = result {
+                    assert!(matches!(err, PutRecordError::QuorumFailed { .. }));
+                    tracing::warn!(
+                        "put record quorum failed, should not happen if launched sufficient peers"
+                    );
+                }
+                ControlFlow::Break(())
+            }
             _ => ControlFlow::Continue(()),
         })
         .await

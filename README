@@ -1,0 +1,37 @@
+Reproduce Evaluation of Real-world Deployment
+
+* On evaluation AWS account, enable evaluated regions and add a key pair called "Ephemeral"
+    * ap-east-1 (Hong Kong)
+    * ap-southeast-1 (Singapore)
+    * us-west-1 (North California)
+    * eu-central-1 (Frankfurt)
+    * sa-east-1 (Sao Paulo)
+    * af-south-1 (Cape Town)
+
+* Configure control node to:
+    * Run Ubuntu 22.04 (because artifact will be compiled on control node and send to cluster nodes)
+    * Install Rust toolchain, Terraform, Ansible
+    * Set up AWS credential properly, so it has EC2 and VPC permissions
+    * Set up SSH to use the "Ephemeral" identity when host name matches wildcard `*.compute.amazonaws.com`
+
+```
+$ terraform -chdir=crates/esys_entropy/terraform apply
+$ ansible-playbook -i inventory.ini crates/esys_entropy/playbook.yml
+```
+
+[Work in progress: evaluated data file location]
+
+Clean up
+```
+$ ansible-playbook -i inventory.ini playbook-shutdown.yml # optional
+$ terraform -chdir=crates/esys_entropy/terraform destroy
+```
+
+
+Reproduce Evaluation of Simulation
+
+```
+$ cargo run -r -p esys_simulated
+```
+
+[Work in progress: pipe output CSV data into plot script]

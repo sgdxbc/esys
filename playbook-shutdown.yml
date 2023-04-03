@@ -2,3 +2,4 @@
 - hosts: all
   tasks:
   - ansible.builtin.shell: pkill -INT esys || true
+  # - ansible.builtin.shell: tmux kill-session -t esys || true

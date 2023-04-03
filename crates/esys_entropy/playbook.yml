@@ -2,6 +2,10 @@
 - name: Common setup
   hosts: all
   tasks:
+  - name: Compile artifact
+    local_action:
+      ansible.builtin.shell cargo build --release --package esys_entropy
+    run_once: true
   - name: Copy compiled artifact
     ansible.builtin.copy:
       src: ../../target/release/esys_entropy

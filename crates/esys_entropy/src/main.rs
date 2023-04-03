@@ -57,7 +57,7 @@ async fn main() {
         for task in tasks {
             controls.push(task.await.unwrap());
         }
-        tracing::info!("register done");
+        tracing::info!("peers register done");
 
         ctrl_c().await.unwrap();
         drop(controls);
