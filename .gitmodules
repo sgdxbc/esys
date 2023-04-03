@@ -1,0 +1,3 @@
+[submodule "crates/esys_wirehair/wirehair"]
+	path = crates/esys_wirehair/wirehair
+	url = https://github.com/catid/wirehair
