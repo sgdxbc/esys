@@ -14,13 +14,14 @@ struct Config {
     fragment_n: u32,
     fragment_k: u32,
     allow_data_lost: bool,
-    committee_check_interval_sec: u32,
+    check_sec: u32,
 }
 
 #[derive(Debug)]
 enum Event {
     Churn,
-    RefillCommittee(ObjectId, ChunkId),
+    Evict(ObjectId, ChunkId, FragmentId),
+    CheckCommittee(ObjectId, ChunkId),
     End,
 }
 
@@ -98,7 +99,7 @@ impl System {
         system
     }
 
-    fn add_event(&mut self, after: u32, event: Event) {
+    fn insert_event(&mut self, after: u32, event: Event) {
         let at = self.now + after;
         let id = self.next_event;
         self.next_event += 1;
@@ -120,7 +121,7 @@ impl System {
         assert!(!exit_node.faulty);
         for ((object_id, chunk_id), fragment_id) in exit_node.fragments {
             let node_id = self.remove_fragment(object_id, chunk_id, fragment_id, &mut rng);
-            assert_eq!(node_id, exit_id);
+            assert_eq!(node_id, Some(exit_id));
         }
     }
 
@@ -135,6 +136,11 @@ impl System {
             {
                 self.objects[id as usize].alive_count += 1;
             }
+            // randomize duration until first check to avoid event congestion
+            self.insert_event(
+                rng.gen_range(1..self.config.check_sec),
+                Event::CheckCommittee(id, chunk_id),
+            );
         }
     }
     // we don't simulate remove object :)
@@ -188,14 +194,22 @@ impl System {
         chunk_id: ChunkId,
         fragment_id: FragmentId,
         mut rng: impl Rng,
-    ) -> NodeId {
+    ) -> Option<NodeId> {
         let object = &mut self.objects[object_id as usize];
         let chunk = &mut object.chunks[chunk_id as usize];
-        let prev_count = chunk.alive_count;
-        let node_id = chunk.fragments.remove(&fragment_id).unwrap();
-        // assert!(!self.nodes[&node_id].faulty);
-        chunk.alive_count -= 1;
+        let Some(node_id) = chunk.fragments.remove(&fragment_id) else {
+            return None; // the node is already removed previously, could happen when eviction
+        };
+        if let Some(node) = self.nodes.get_mut(&node_id) {
+            let removed_id = node.fragments.remove(&(object_id, chunk_id));
+            assert_eq!(removed_id, Some(fragment_id));
+            if node.faulty {
+                return Some(node_id);
+            }
+        } // otherwise the node is removed, could happen when removing node
 
+        let prev_count = chunk.alive_count;
+        chunk.alive_count -= 1;
         if prev_count == self.config.fragment_k {
             let prev_count = object.alive_count;
             object.alive_count -= 1;
@@ -205,24 +219,14 @@ impl System {
             }
         }
 
-        // when chunk is not recoverable, refilling is not possible
-        if prev_count as u32 > self.config.chunk_k {
-            self.add_event(
-                // in the worst case the peer fails immediately after sending heartbeat, which is immediately after
-                // the committee start a new checking interval
-                rng.gen_range(1..self.config.committee_check_interval_sec * 2),
-                Event::RefillCommittee(object_id, chunk_id),
-            );
-        }
-
-        node_id
+        Some(node_id)
     }
 
     fn add_churn_event(&mut self, mut rng: impl Rng) {
         let expect_interval =
             (86400. * 365.) / (self.config.churn_rate * self.config.node_count as f32);
         let after = Poisson::new(expect_interval).unwrap().sample(&mut rng) as u32;
-        self.add_event(after, Event::Churn);
+        self.insert_event(after, Event::Churn);
     }
 
     fn on_churn(&mut self, mut rng: impl Rng) {
@@ -242,7 +246,7 @@ impl System {
         self.add_churn_event(&mut rng);
     }
 
-    fn on_refill_committee(&mut self, object_id: ObjectId, chunk_id: ChunkId, rng: impl Rng) {
+    fn on_check_committee(&mut self, object_id: ObjectId, chunk_id: ChunkId, rng: impl Rng) {
         if (self.objects[object_id as usize].chunks[chunk_id as usize]
             .fragments
             .len() as u32)
@@ -253,8 +257,24 @@ impl System {
         self.fill_chunk(object_id, chunk_id, rng);
     }
 
+    fn on_evict(
+        &mut self,
+        object_id: ObjectId,
+        chunk_id: ChunkId,
+        fragment_id: FragmentId,
+        rng: impl Rng,
+    ) {
+        self.remove_fragment(object_id, chunk_id, fragment_id, rng);
+        self.insert_event(
+            self.config.evict_interval(),
+            Event::Evict(object_id, chunk_id, fragment_id + 1),
+        );
+    }
+
+    fn on_end(&mut self) {}
+
     fn run(&mut self, mut rng: impl Rng) {
-        self.add_event(self.config.duration * 86400 * 365, Event::End);
+        self.insert_event(self.config.duration * 86400 * 365, Event::End);
         loop {
             let event;
             ((self.now, _), event) = self.events.pop_first().unwrap();
@@ -262,12 +282,24 @@ impl System {
             use Event::*;
             match event {
                 Churn => self.on_churn(&mut rng),
-                RefillCommittee(object_id, chunk_id) => {
-                    self.on_refill_committee(object_id, chunk_id, &mut rng)
+                CheckCommittee(object_id, chunk_id) => {
+                    self.on_check_committee(object_id, chunk_id, &mut rng)
                 }
-                End => break,
+                Evict(object_id, chunk_id, fragment_id) => {
+                    self.on_evict(object_id, chunk_id, fragment_id, &mut rng)
+                }
+                End => {
+                    self.on_end();
+                    break;
+                }
             }
         }
+    }
+}
+
+impl Config {
+    fn evict_interval(&self) -> u32 {
+        (365. * 86400. / self.churn_rate / self.fragment_n as f32) as _
     }
 }
 
@@ -276,14 +308,14 @@ fn main() {
         churn_rate: 1.,
         node_count: 1000,
         duration: 1,
-        faulty_rate: 0.,
+        faulty_rate: 0.1,
         object_count: 1,
         chunk_n: 1,
         chunk_k: 1,
         fragment_n: 100,
         fragment_k: 80,
         allow_data_lost: false,
-        committee_check_interval_sec: 12 * 60 * 60,
+        check_sec: 12 * 60 * 60,
     };
     let mut system = System::new(config, thread_rng());
     system.run(thread_rng());
