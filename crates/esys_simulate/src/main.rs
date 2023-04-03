@@ -13,10 +13,15 @@ struct Config {
     chunk_k: u32,
     fragment_n: u32,
     fragment_k: u32,
+    allow_data_lost: bool,
+    committee_check_interval_sec: u32,
 }
 
+#[derive(Debug)]
 enum Event {
     Churn,
+    RefillCommittee(ObjectId, ChunkId),
+    End,
 }
 
 struct System {
@@ -41,10 +46,22 @@ struct Node {
 
 #[derive(Default, Clone)]
 struct Object {
-    // cache of `len(_ for chunk in chunks if len(chunk) >= k)`
+    // cache of `len(_ for chunk in chunks if chunk is still alive)`
     alive_count: u32,
+    chunks: Vec<Chunk>,
+}
+
+// `Committee` at the same time
+#[derive(Default, Clone)]
+struct Chunk {
     // [{reverse map fragment => node}]
-    chunks: Vec<HashMap<FragmentId, NodeId>>,
+    // this the fragments that "seems to exist" i.e. faulty nodes are included
+    // committee use this size to conduct refilling
+    fragments: HashMap<FragmentId, NodeId>,
+    // cache of `len(_ for fragment in fragments if fragment.node is not faulty)`
+    // simulation use this count to determine chunk liveness
+    alive_count: u32,
+    next_fragment: FragmentId,
 }
 
 type Instant = u32;
@@ -56,6 +73,7 @@ type FragmentId = u32;
 #[derive(Debug, Default)]
 struct Stats {
     churn: u32,
+    data_lost: u32,
 }
 
 impl System {
@@ -97,15 +115,54 @@ impl System {
         self.nodes.insert(id, node);
     }
 
-    fn add_object(&mut self, id: u32, mut rng: impl Rng) {
-        for chunk_id in 0..self.config.chunk_n {
-            for fragment_id in 0..self.config.fragment_n {
-                self.add_fragment(id, chunk_id, fragment_id, &mut rng);
-            }
+    fn remove_node(&mut self, exit_id: NodeId, mut rng: impl Rng) {
+        let exit_node = self.nodes.remove(&exit_id).unwrap();
+        assert!(!exit_node.faulty);
+        for ((object_id, chunk_id), fragment_id) in exit_node.fragments {
+            let node_id = self.remove_fragment(object_id, chunk_id, fragment_id, &mut rng);
+            assert_eq!(node_id, exit_id);
         }
     }
 
-    fn add_fragment(&mut self, object_id: u32, chunk_id: u32, fragment_id: u32, mut rng: impl Rng) {
+    fn add_object(&mut self, id: u32, mut rng: impl Rng) {
+        self.objects[id as usize]
+            .chunks
+            .resize(self.config.chunk_n as _, Default::default());
+        for chunk_id in 0..self.config.chunk_n {
+            self.fill_chunk(id, chunk_id, &mut rng);
+            if self.objects[id as usize].chunks[chunk_id as usize].alive_count
+                >= self.config.fragment_k
+            {
+                self.objects[id as usize].alive_count += 1;
+            }
+        }
+    }
+    // we don't simulate remove object :)
+
+    fn fill_chunk(&mut self, object_id: u32, chunk_id: u32, mut rng: impl Rng) {
+        // when certain fragment is "skipped" by reason described in `add_fragment`, this filling may not be "instant",
+        // i.e. it should take several "committee check round" to finish
+        // TODO consider simulate this duration
+        while (self.objects[object_id as usize].chunks[chunk_id as usize]
+            .fragments
+            .len() as u32)
+            < self.config.fragment_n
+        {
+            self.add_fragment(object_id, chunk_id, &mut rng);
+        }
+        if self.objects[object_id as usize].chunks[chunk_id as usize].alive_count
+            < self.config.fragment_k
+        {
+            // this should not happen at all...at least for genuine entropy
+            todo!()
+        }
+    }
+
+    fn add_fragment(&mut self, object_id: u32, chunk_id: u32, mut rng: impl Rng) {
+        let chunk = &mut self.objects[object_id as usize].chunks[chunk_id as usize];
+        let fragment_id = chunk.next_fragment;
+        chunk.next_fragment += 1;
+
         // simulate random fragment hash + closest distance with `.choose()`
         // it's unlikely for a node to have double (or even more) responsibility in the same committee
         // but if that actually happen, the honest behavior is to keep unresponsive to the higher fragment index
@@ -113,11 +170,52 @@ impl System {
         // in this way no more than one fragment will be (trustfully) stored in the same failure domain
 
         let (node_id, node) = self.nodes.iter_mut().choose(&mut rng).unwrap();
-        if node.faulty || node.fragments.contains_key(&(object_id, chunk_id)) {
+        // this is a committee consensus, so even it's duplicated responsibility of faulty node, the fragment can be
+        // skipped successfully
+        if node.fragments.contains_key(&(object_id, chunk_id)) {
             return;
         }
         node.fragments.insert((object_id, chunk_id), fragment_id);
-        self.objects[object_id as usize][chunk_id as usize].insert(fragment_id, *node_id);
+        chunk.fragments.insert(fragment_id, *node_id);
+        if !node.faulty {
+            chunk.alive_count += 1;
+        }
+    }
+
+    fn remove_fragment(
+        &mut self,
+        object_id: ObjectId,
+        chunk_id: ChunkId,
+        fragment_id: FragmentId,
+        mut rng: impl Rng,
+    ) -> NodeId {
+        let object = &mut self.objects[object_id as usize];
+        let chunk = &mut object.chunks[chunk_id as usize];
+        let prev_count = chunk.alive_count;
+        let node_id = chunk.fragments.remove(&fragment_id).unwrap();
+        // assert!(!self.nodes[&node_id].faulty);
+        chunk.alive_count -= 1;
+
+        if prev_count == self.config.fragment_k {
+            let prev_count = object.alive_count;
+            object.alive_count -= 1;
+            if prev_count == self.config.chunk_k {
+                assert!(self.config.allow_data_lost);
+                self.stats.data_lost += 1;
+            }
+        }
+
+        // when chunk is not recoverable, refilling is not possible
+        if prev_count as u32 > self.config.chunk_k {
+            self.add_event(
+                // in the worst case the peer fails immediately after sending heartbeat, which is immediately after
+                // the committee start a new checking interval
+                rng.gen_range(1..self.config.committee_check_interval_sec * 2),
+                Event::RefillCommittee(object_id, chunk_id),
+            );
+        }
+
+        node_id
     }
 
     fn add_churn_event(&mut self, mut rng: impl Rng) {
@@ -127,31 +225,6 @@ impl System {
         self.add_event(after, Event::Churn);
     }
 
-    fn remove_fragment(
-        &mut self,
-        object_id: ObjectId,
-        chunk_id: ChunkId,
-        fragment_id: FragmentId,
-    ) -> Option<NodeId> {
-        let object = &mut self.objects[object_id as usize];
-        if object.is_empty() {
-            return None;
-        }
-        let chunk = &mut object[chunk_id as usize];
-        if chunk.is_empty() {
-            return None;
-        }
-        let node_id = chunk.remove(&fragment_id);
-        assert!(node_id.is_some());
-
-        if (chunk.len() as u32) < self.config.chunk_k {
-            // TODO record chunk lost?
-            chunk.clear();
-        }
-
-        node_id
-    }
-
     fn on_churn(&mut self, mut rng: impl Rng) {
         self.stats.churn += 1;
 
@@ -159,33 +232,40 @@ impl System {
         // faulty node never leave
         // because faulty node never store anything, so does not "discard nothing" here should not make the attack even
         // weaker
-        // if faulty node always live, it can stay in the committee until get kicked out, so it should make the attack
-        // stronger
+        // if faulty node always live, it can stay in the committee until get kicked out, and this should make the
+        // attack stronger
         if !exit_node.faulty {
-            let exit_id = *exit_id;
-            let exit_node = self.nodes.remove(&exit_id).unwrap();
-            for ((object_id, chunk_id), framgent_id) in exit_node.fragments {
-                let committee = &mut self.objects[object_id as usize][chunk_id as usize];
-                let node_id = committee.remove(&framgent_id);
-                assert_eq!(node_id, Some(exit_id));
-                if (committee.len() as u32) < self.config.fragment_k {
-                    //
-                }
-            }
-
+            self.remove_node(*exit_id, &mut rng);
             self.add_node(false); // prevent increase number of faulty
         }
 
         self.add_churn_event(&mut rng);
     }
 
+    fn on_refill_committee(&mut self, object_id: ObjectId, chunk_id: ChunkId, rng: impl Rng) {
+        if (self.objects[object_id as usize].chunks[chunk_id as usize]
+            .fragments
+            .len() as u32)
+            < self.config.fragment_k
+        {
+            unreachable!() // for now
+        }
+        self.fill_chunk(object_id, chunk_id, rng);
+    }
+
     fn run(&mut self, mut rng: impl Rng) {
-        while self.now < self.config.duration * 86400 * 365 {
+        self.add_event(self.config.duration * 86400 * 365, Event::End);
+        loop {
             let event;
             ((self.now, _), event) = self.events.pop_first().unwrap();
+            println!("{event:?}");
             use Event::*;
             match event {
                 Churn => self.on_churn(&mut rng),
+                RefillCommittee(object_id, chunk_id) => {
+                    self.on_refill_committee(object_id, chunk_id, &mut rng)
+                }
+                End => break,
             }
         }
     }
@@ -195,13 +275,15 @@ fn main() {
     let config = Config {
         churn_rate: 1.,
         node_count: 1000,
-        duration: 10,
-        faulty_rate: 0.1,
+        duration: 1,
+        faulty_rate: 0.,
         object_count: 1,
         chunk_n: 1,
         chunk_k: 1,
-        fragment_n: 1,
-        fragment_k: 1,
+        fragment_n: 100,
+        fragment_k: 80,
+        allow_data_lost: false,
+        committee_check_interval_sec: 12 * 60 * 60,
     };
     let mut system = System::new(config, thread_rng());
     system.run(thread_rng());

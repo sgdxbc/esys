@@ -31,7 +31,7 @@ $ terraform -chdir=crates/esys_entropy/terraform destroy
 Reproduce Evaluation of Simulation
 
 ```
-$ cargo run -r -p esys_simulated
+$ cargo run -r -p esys_simulate
 ```
 
 [Work in progress: pipe output CSV data into plot script]
