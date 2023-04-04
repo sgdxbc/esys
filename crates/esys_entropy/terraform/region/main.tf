@@ -9,6 +9,7 @@ terraform {
 
 resource "aws_vpc" "esys-entropy" {
   cidr_block = "10.0.0.0/16"
+  enable_dns_hostnames = true
 }
 
 resource "aws_subnet" "esys-entropy" {
@@ -84,6 +85,11 @@ resource "aws_instance" "esys-entropy" {
   key_name               = "Ephemeral"
 }
 
-output "address" {
+output "dns" {
+  value = resource.aws_instance.esys-entropy.public_dns
+}
+
+output "ip" {
   value = resource.aws_instance.esys-entropy.public_ip
 }
+

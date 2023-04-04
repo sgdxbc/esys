@@ -9,6 +9,7 @@ terraform {
 
 resource "aws_vpc" "esys-pingpong" {
   cidr_block = "10.0.0.0/16"
+  enable_dns_hostnames = true
 }
 
 resource "aws_subnet" "esys-pingpong" {
@@ -79,6 +80,6 @@ resource "aws_instance" "esys-pingpong" {
   key_name               = "Ephemeral"
 }
 
-output "address" {
-  value = resource.aws_instance.esys-pingpong.public_ip
+output "dns" {
+  value = resource.aws_instance.esys-pingpong.public_dns
 }

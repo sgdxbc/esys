@@ -31,10 +31,10 @@ module "region-2" {
   }
 }
 
-output "address-1" {
-  value = module.region-1.address
+output "dns-1" {
+  value = module.region-1.dns
 }
 
-output "address-2" {
-  value = module.region-2.address
+output "dns-2" {
+  value = module.region-2.dns
 }

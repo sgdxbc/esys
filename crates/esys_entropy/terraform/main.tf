@@ -48,9 +48,12 @@ module "region-2" {
 resource "local_file" "inventory" {
   content = templatefile(
     "${path.module}/inventory.ini.tpl", {
-      service  = module.service.address,
-      region-1 = module.region-1.address,
-      region-2 = module.region-2.address,
+      service       = module.service.ip,
+      service-host  = module.service.dns,
+      region-1      = module.region-1.ip,
+      region-1-host = module.region-1.dns,
+      region-2      = module.region-2.ip,
+      region-2-host = module.region-2.dns,
   })
   filename = "../../../inventory.ini"
 }
