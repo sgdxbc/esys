@@ -10,6 +10,7 @@ On evaluation AWS account, enable evaluated regions and add a key pair called "E
 
 Prepare control node
 * Run Ubuntu 22.04 (because artifact will be compiled on control node and send to cluster nodes)
+    * As user "ubuntu"
 * Install Rust toolchain, C++ toolchain, CMake, Terraform, Ansible
 * Set up AWS credential properly, so it has EC2 and VPC permissions
 * Add this section to SSH config
@@ -23,6 +24,7 @@ Host *.compute.amazonaws.com
 
 Start evaluation
 ```
+$ git submodule init
 $ terraform -chdir=crates/esys_entropy/terraform apply
 $ ansible-playbook -i inventory.ini crates/esys_entropy/playbook.yml
 ```

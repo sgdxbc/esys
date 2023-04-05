@@ -8,7 +8,7 @@ terraform {
 }
 
 resource "aws_vpc" "esys-entropy" {
-  cidr_block = "10.0.0.0/16"
+  cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
 }
 
@@ -73,7 +73,7 @@ data "aws_ami" "ubuntu" {
 }
 
 variable "instance_type" {
-  type = string
+  type    = string
   default = "c5.2xlarge"
 }
 
@@ -92,4 +92,3 @@ output "dns" {
 output "ip" {
   value = resource.aws_instance.esys-entropy.public_ip
 }
-
