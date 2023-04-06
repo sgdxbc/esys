@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package behavior.proto;
+
+message Request {
+    //
+}
+
+message Response {
+    //
+}

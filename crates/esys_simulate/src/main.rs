@@ -6,7 +6,7 @@
 //
 // There's no latency between committee member exits and committee finishes to find new member. Actually, just treat the
 // `Churn` event as "the event where committee reach concensus on the member has exited". The member node actually exit
-// (probably short) before that. Here we are an assumption that the committee realize member exiting in bounded time.
+// (probably short) before that. Here we have an assumption that the committee realize member exiting in bounded time.
 // This should be true in our network model.
 //
 // One consequence of the two above is the "unstability" brought by VRF is not simulated. In reality, VRF may choose
@@ -110,7 +110,7 @@ impl System {
         }
         system.add_churn_event(&mut rng);
         system.insert_event(
-            system.config.increase_watermark_interval(),
+            system.config.increase_watermark_interval_sec(),
             Event::IncreaseWatermark(0),
         );
         system
@@ -279,7 +279,7 @@ impl System {
             }
         }
         self.insert_event(
-            self.config.increase_watermark_interval(),
+            self.config.increase_watermark_interval_sec(),
             Event::IncreaseWatermark(fragment_id + 1),
         );
     }
@@ -306,7 +306,7 @@ impl System {
 }
 
 impl Config {
-    fn increase_watermark_interval(&self) -> u32 {
+    fn increase_watermark_interval_sec(&self) -> u32 {
         (365. * 86400. / self.churn_rate / self.fragment_n as f32) as _
     }
 }

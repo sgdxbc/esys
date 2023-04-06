@@ -14,11 +14,11 @@ use libp2p::{
     identity::Keypair,
     swarm::{
         handler::{ConnectionEvent, FullyNegotiatedInbound, FullyNegotiatedOutbound},
-        ConnectionHandler, ConnectionHandlerEvent, KeepAlive, NetworkBehaviour,
-        NetworkBehaviourAction, SubstreamProtocol, SwarmEvent,
+        ConnectionHandler, ConnectionHandlerEvent, KeepAlive, NetworkBehaviour, SubstreamProtocol,
+        SwarmBuilder, SwarmEvent, ToSwarm,
     },
     tcp::{self, tokio::Transport},
-    Multiaddr, PeerId, Swarm, Transport as _,
+    Multiaddr, PeerId, Transport as _,
 };
 
 #[tokio::main(flavor = "current_thread")]
@@ -48,7 +48,7 @@ async fn main() {
         // .multiplex(libp2p::mplex::MplexConfig::new())
         .multiplex(libp2p::yamux::YamuxConfig::default())
         .boxed();
-    let mut swarm = Swarm::with_tokio_executor(transport, Behaviour::default(), id);
+    let mut swarm = SwarmBuilder::with_tokio_executor(transport, Behaviour::default(), id).build();
     match task {
         Task::Pong => {
             swarm
@@ -100,9 +100,9 @@ impl NetworkBehaviour for Behaviour {
         &mut self,
         _cx: &mut std::task::Context<'_>,
         _params: &mut impl libp2p::swarm::PollParameters,
-    ) -> Poll<NetworkBehaviourAction<Self::OutEvent, libp2p::swarm::THandlerInEvent<Self>>> {
+    ) -> Poll<ToSwarm<Self::OutEvent, libp2p::swarm::THandlerInEvent<Self>>> {
         match self.0.take() {
-            Some(event) => Poll::Ready(NetworkBehaviourAction::GenerateEvent(event)),
+            Some(event) => Poll::Ready(ToSwarm::GenerateEvent(event)),
             None => Poll::Pending,
         }
     }

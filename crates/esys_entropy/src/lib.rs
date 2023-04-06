@@ -1,3 +1,5 @@
+mod behavior;
+
 use std::{future::Future, mem::take, ops::ControlFlow};
 
 use libp2p::{
@@ -11,7 +13,11 @@ use libp2p::{
     },
     multiaddr,
     multihash::Multihash,
-    swarm::{AddressScore, NetworkBehaviour, SwarmEvent, THandlerErr},
+    request_response::ProtocolSupport,
+    swarm::{
+        AddressScore, NetworkBehaviour as NetworkBehavior, SwarmBuilder, SwarmEvent,
+        THandlerErr as HandlerErr,
+    },
     Multiaddr, PeerId, Swarm,
 };
 use tokio::{
@@ -20,10 +26,11 @@ use tokio::{
     task::JoinHandle,
 };
 
-#[derive(NetworkBehaviour)]
+#[derive(NetworkBehavior)]
 pub struct App {
     identify: identify::Behaviour,
     kad: Kademlia<MemoryStore>,
+    entropy: behavior::Behavior,
 }
 
 #[derive(Clone)]
@@ -34,7 +41,7 @@ pub struct AppControl {
 }
 
 pub type AppObserver = Box<dyn FnMut(&ControlEvent, &mut Swarm<App>) -> ControlFlow<()> + Send>;
-pub type ControlEvent = SwarmEvent<AppEvent, THandlerErr<App>>;
+pub type ControlEvent = SwarmEvent<AppEvent, HandlerErr<App>>;
 
 impl App {
     pub fn run(
@@ -49,8 +56,13 @@ impl App {
                 keypair.public(),
             )),
             kad: Kademlia::new(id, MemoryStore::new(id)),
+            entropy: behavior::Behavior::new(
+                Default::default(),
+                [(behavior::Protocol, ProtocolSupport::Full)],
+                Default::default(),
+            ),
         };
-        let mut swarm = Swarm::with_tokio_executor(transport, app, id);
+        let mut swarm = SwarmBuilder::with_tokio_executor(transport, app, id).build();
         let mut ingress = mpsc::unbounded_channel();
         let control = AppControl { ingress: ingress.0 };
         let name = name.to_string();
