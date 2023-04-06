@@ -15,7 +15,7 @@
 // accidents, simulating by selecting exact number of committee members whenever necessary should give the equivalent
 // result.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rand::{seq::IteratorRandom, thread_rng, Rng};
 use rand_distr::{Distribution, Poisson};
@@ -31,6 +31,7 @@ struct Config {
     fragment_n: u32,
     fragment_k: u32,
     allow_data_lost: bool,
+    targeted_count: u32,
 }
 
 #[derive(Debug)]
@@ -46,6 +47,7 @@ struct System {
     now: u32,
 
     nodes: HashMap<NodeId, Node>,
+    targeted_nodes: HashSet<NodeId>,
     objects: Vec<Object>,
     next_node: NodeId,
     next_event: u32,
@@ -76,6 +78,7 @@ struct Chunk {
     alive_count: u32,
     // lowest fragment that has not yet (tried to) be included in the committee
     next_fragment: FragmentId,
+    targeted: bool,
 }
 
 type Instant = u32;
@@ -88,6 +91,7 @@ type FragmentId = u32;
 struct Stats {
     churn: u32,
     data_lost: u32,
+    targeted: u32,
 }
 
 impl System {
@@ -96,18 +100,39 @@ impl System {
             events: Default::default(),
             now: 0,
             nodes: Default::default(),
+            targeted_nodes: Default::default(),
             objects: Default::default(),
             next_node: 0,
             next_event: 0,
             stats: Default::default(),
             config,
         };
+
         for _ in 0..system.config.node_count {
             system.add_node(rng.gen_bool(system.config.faulty_rate as _));
         }
         for _ in 0..system.config.object_count {
             system.add_object(&mut rng);
         }
+
+        for _ in 0..system.config.targeted_count {
+            let (mut object_id, mut chunk_id);
+            while {
+                (object_id, chunk_id) = (
+                    rng.gen_range(0..system.config.object_count),
+                    rng.gen_range(0..system.config.chunk_n),
+                );
+                system.objects[object_id as usize].chunks[chunk_id as usize].targeted
+            } {}
+            let chunk = &mut system.objects[object_id as usize].chunks[chunk_id as usize];
+            chunk.targeted = true;
+            system.targeted_nodes.extend(chunk.fragments.values());
+        }
+        system
+            .targeted_nodes
+            .retain(|node_id| !system.nodes[node_id].faulty);
+        system.stats.targeted = system.targeted_nodes.len() as _;
+
         system.add_churn_event(&mut rng);
         system.insert_event(
             system.config.increase_watermark_interval_sec(),
@@ -136,10 +161,12 @@ impl System {
     fn remove_node(&mut self, exit_id: NodeId, mut rng: impl Rng) {
         let exit_node = self.nodes.remove(&exit_id).unwrap();
         assert!(!exit_node.faulty);
+        self.targeted_nodes.remove(&exit_id);
         for ((object_id, chunk_id), fragment_id) in exit_node.fragments {
             let node_id = self.remove_fragment(object_id, chunk_id, fragment_id);
             assert_eq!(node_id, exit_id);
-            if self.chunk_alive(object_id, chunk_id) {
+            // refill for targeted but recoverable chunks
+            if self.chunk_recoverable(object_id, chunk_id) {
                 self.fill_chunk(object_id, chunk_id, &mut rng);
             }
         }
@@ -161,34 +188,39 @@ impl System {
     }
     // we don't simulate remove object :)
 
-    fn chunk_alive(&self, object_id: u32, chunk_id: u32) -> bool {
-        self.objects[object_id as usize].chunks[chunk_id as usize].alive_count
-            >= self.config.fragment_k
+    fn chunk(&self, object_id: ObjectId, chunk_id: ChunkId) -> &Chunk {
+        &self.objects[object_id as usize].chunks[chunk_id as usize]
+    }
+
+    fn chunk_mut(&mut self, object_id: ObjectId, chunk_id: ChunkId) -> &mut Chunk {
+        &mut self.objects[object_id as usize].chunks[chunk_id as usize]
+    }
+
+    fn chunk_alive(&self, object_id: ObjectId, chunk_id: ChunkId) -> bool {
+        !self.chunk(object_id, chunk_id).targeted && self.chunk_recoverable(object_id, chunk_id)
+    }
+
+    fn chunk_recoverable(&self, object_id: ObjectId, chunk_id: ChunkId) -> bool {
+        self.chunk(object_id, chunk_id).alive_count >= self.config.fragment_k
     }
 
     fn fill_chunk(&mut self, object_id: u32, chunk_id: u32, mut rng: impl Rng) {
-        while (self.objects[object_id as usize].chunks[chunk_id as usize]
-            .fragments
-            .len() as u32)
-            < self.config.fragment_n
-        {
+        while (self.chunk(object_id, chunk_id).fragments.len() as u32) < self.config.fragment_n {
             self.add_fragment(object_id, chunk_id, &mut rng);
         }
     }
 
     fn add_fragment(&mut self, object_id: u32, chunk_id: u32, mut rng: impl Rng) {
-        let chunk = &mut self.objects[object_id as usize].chunks[chunk_id as usize];
+        let chunk = self.chunk_mut(object_id, chunk_id);
         let fragment_id = chunk.next_fragment;
         chunk.next_fragment += 1;
 
         // simulate random fragment hash + closest distance with `.choose()`
+        let (node_id, node) = self.nodes.iter_mut().choose(&mut rng).unwrap();
         // it's unlikely for a node to have double (or even more) responsibility in the same committee
         // but if that actually happen, the honest behavior is to keep unresponsive to the higher fragment index
         // so the committee will skip it soon
         // in this way no more than one fragment will be (trustfully) stored in the same failure domain
-
-        // TODO select node with simulated VRF
-        let (node_id, node) = self.nodes.iter_mut().choose(&mut rng).unwrap();
         // this is a committee consensus, so even it's duplicated responsibility of faulty node, the fragment can be
         // skipped successfully
         // TODO not sure whether it is still true for current weaker consensus
@@ -196,9 +228,15 @@ impl System {
             return;
         }
         node.fragments.insert((object_id, chunk_id), fragment_id);
-        chunk.fragments.insert(fragment_id, *node_id);
-        if !node.faulty {
+        let node_id = *node_id;
+        let faulty = node.faulty;
+        let chunk = self.chunk_mut(object_id, chunk_id);
+        chunk.fragments.insert(fragment_id, node_id);
+        if !faulty {
             chunk.alive_count += 1;
+        }
+        if chunk.targeted {
+            self.targeted_nodes.insert(node_id);
         }
     }
 
@@ -208,9 +246,11 @@ impl System {
         chunk_id: ChunkId,
         fragment_id: FragmentId,
     ) -> NodeId {
-        let object = &mut self.objects[object_id as usize];
-        let chunk = &mut object.chunks[chunk_id as usize];
-        let node_id = chunk.fragments.remove(&fragment_id).unwrap();
+        let node_id = self
+            .chunk_mut(object_id, chunk_id)
+            .fragments
+            .remove(&fragment_id)
+            .unwrap();
 
         // if the node is still in `nodes`, this removing is caused by watermark
         let lost_fragment = if let Some(node) = self.nodes.get_mut(&node_id) {
@@ -222,9 +262,10 @@ impl System {
             true
         };
         if lost_fragment {
-            let prev_count = chunk.alive_count;
-            chunk.alive_count -= 1;
-            if prev_count == self.config.fragment_k {
+            let prev_alive = self.chunk_alive(object_id, chunk_id);
+            self.chunk_mut(object_id, chunk_id).alive_count -= 1;
+            if prev_alive && !self.chunk_alive(object_id, chunk_id) {
+                let object = &mut self.objects[object_id as usize];
                 let prev_count = object.alive_count;
                 object.alive_count -= 1;
                 if prev_count == self.config.chunk_k {
@@ -258,6 +299,7 @@ impl System {
             // the new node is added after all involved committee find their new members
             // seems reasonable and not increasing durability
             self.add_node(false); // prevent increase number of faulty
+            self.stats.targeted = u32::min(self.stats.targeted, self.targeted_nodes.len() as _);
         }
 
         self.add_churn_event(&mut rng);
@@ -273,6 +315,7 @@ impl System {
             }
         }
         for (object_id, chunk_id) in evictions {
+            // TODO remove targeted node
             self.remove_fragment(object_id, chunk_id, fragment_id);
             if self.chunk_alive(object_id, chunk_id) {
                 self.fill_chunk(object_id, chunk_id, &mut rng);
@@ -316,13 +359,14 @@ fn main() {
         churn_rate: 0.1,
         node_count: 10000,
         duration: 10,
-        faulty_rate: 0.33,
-        object_count: 100,
-        chunk_n: 1,
-        chunk_k: 1,
-        fragment_n: 300,
-        fragment_k: 100,
+        faulty_rate: 0.,
+        object_count: 1,
+        chunk_n: 100,
+        chunk_k: 80,
+        fragment_n: 200,
+        fragment_k: 80,
         allow_data_lost: true,
+        targeted_count: 10,
     };
     let mut system = System::new(config, thread_rng());
     system.run(thread_rng());

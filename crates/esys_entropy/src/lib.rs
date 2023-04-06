@@ -35,11 +35,11 @@ pub struct App {
 
 #[derive(Clone)]
 pub struct AppControl {
-    ingress: mpsc::UnboundedSender<
-        Box<dyn FnOnce(&mut Swarm<App>, &mut Vec<(AppObserver, oneshot::Sender<()>)>) + Send>,
-    >,
+    ingress: mpsc::UnboundedSender<IngressTask>,
 }
 
+type IngressTask =
+    Box<dyn FnOnce(&mut Swarm<App>, &mut Vec<(AppObserver, oneshot::Sender<()>)>) + Send>;
 pub type AppObserver = Box<dyn FnMut(&ControlEvent, &mut Swarm<App>) -> ControlFlow<()> + Send>;
 pub type ControlEvent = SwarmEvent<AppEvent, HandlerErr<App>>;
 
