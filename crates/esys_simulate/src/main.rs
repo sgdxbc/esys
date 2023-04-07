@@ -35,7 +35,10 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeMap;
 
-use rand::{seq::IteratorRandom, thread_rng, Rng};
+use rand::{
+    seq::{IteratorRandom, SliceRandom},
+    thread_rng, Rng,
+};
 use rand_distr::{Distribution, Poisson};
 
 struct Config {
@@ -65,6 +68,7 @@ struct System {
     now: u32,
 
     nodes: HashMap<NodeId, Node>,
+    nodes_cache: Vec<NodeId>, // speed up node selection
     targeted_nodes: HashSet<NodeId>,
     objects: Vec<Object>,
     next_node: NodeId,
@@ -118,6 +122,7 @@ impl System {
             events: Default::default(),
             now: 0,
             nodes: Default::default(),
+            nodes_cache: Default::default(),
             targeted_nodes: Default::default(),
             objects: Default::default(),
             next_node: 0,
@@ -175,10 +180,14 @@ impl System {
             ..Default::default()
         };
         self.nodes.insert(id, node);
+        self.nodes_cache.push(id);
     }
 
     fn remove_node(&mut self, exit_id: NodeId, mut rng: impl Rng) {
         let exit_node = self.nodes.remove(&exit_id).unwrap();
+        let index = self.nodes_cache.binary_search(&exit_id).unwrap();
+        self.nodes_cache.remove(index); // any better idea?
+
         assert!(!exit_node.faulty);
         self.targeted_nodes.remove(&exit_id);
         for ((object_id, chunk_id), fragment_id) in exit_node.fragments {
@@ -251,7 +260,10 @@ impl System {
         chunk.next_fragment += 1;
 
         // simulate random fragment hash + closest distance with `.choose()`
-        let (node_id, node) = self.nodes.iter_mut().choose(&mut rng).unwrap();
+        // let (node_id, node) = self.nodes.iter_mut().choose(&mut rng).unwrap();
+        let node_id = self.nodes_cache.choose(&mut rng).unwrap();
+        let node = self.nodes.get_mut(node_id).unwrap();
+
         // it's unlikely for a node to have double (or even more) responsibility in the same committee
         // but if that actually happen, the honest behavior is to keep unresponsive to the higher fragment index
         // so the committee will skip it soon
@@ -317,7 +329,9 @@ impl System {
     fn on_churn(&mut self, mut rng: impl Rng) {
         self.stats.churn += 1;
 
-        let (exit_id, exit_node) = self.nodes.iter().choose(&mut rng).unwrap();
+        // let (exit_id, exit_node) = self.nodes.iter().choose(&mut rng).unwrap();
+        let exit_id = self.nodes_cache.choose(&mut rng).unwrap();
+        let exit_node = &self.nodes[exit_id];
         // faulty node never leave
         // because faulty node never store anything, so does not "discard nothing" here should not make the attack even
         // weaker
@@ -388,7 +402,7 @@ fn main() {
         node_count: 10000,
         duration: 10,
         faulty_rate: 0.,
-        object_count: 10,
+        object_count: 100,
         chunk_n: 100,
         chunk_k: 80,
         fragment_n: 200,
