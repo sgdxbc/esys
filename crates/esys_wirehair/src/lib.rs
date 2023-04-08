@@ -80,6 +80,7 @@ unsafe fn wirehair_init() -> WirehairResult {
     unsafe { wirehair_init_(WIREHAIR_VERSION) }
 }
 
+#[derive(Debug)]
 pub struct WirehairEncoder {
     raw: *mut WirehairCodecRaw,
     pub block_bytes: u32,
@@ -88,11 +89,13 @@ unsafe impl Send for WirehairEncoder {} // really?
 
 // not sure whether underlying object is `Sync` or not so let's play safe
 
+#[derive(Debug)]
 pub struct WirehairDecoder {
     raw: *mut WirehairCodecRaw,
     message_bytes: u64,
     block_bytes: u32,
     need_more: bool,
+    converted: bool,
 }
 unsafe impl Send for WirehairDecoder {}
 
@@ -130,6 +133,12 @@ impl WirehairEncoder {
     }
 }
 
+impl Drop for WirehairEncoder {
+    fn drop(&mut self) {
+        unsafe { wirehair_free(self.raw) }
+    }
+}
+
 impl WirehairDecoder {
     pub fn new(message_bytes: u64, block_bytes: u32) -> Self {
         INIT.call_once(|| unsafe {
@@ -142,6 +151,7 @@ impl WirehairDecoder {
             message_bytes,
             block_bytes,
             need_more: true,
+            converted: false,
         }
     }
 
@@ -161,11 +171,20 @@ impl WirehairDecoder {
             .with(())
     }
 
-    pub fn into_encoder(self) -> Result<WirehairEncoder, WirehairResult> {
+    pub fn into_encoder(mut self) -> Result<WirehairEncoder, WirehairResult> {
+        self.converted = true;
         unsafe { wirehair_decoder_become_encoder(self.raw) }.with(WirehairEncoder {
             raw: self.raw,
             block_bytes: self.block_bytes,
         })
+    }
+}
+
+impl Drop for WirehairDecoder {
+    fn drop(&mut self) {
+        if !self.converted {
+            unsafe { wirehair_free(self.raw) }
+        }
     }
 }
 

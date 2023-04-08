@@ -33,9 +33,9 @@ pub struct App {
     entropy: behavior::Behavior,
 }
 
-#[derive(Clone)]
 pub struct AppControl {
     ingress: mpsc::UnboundedSender<IngressTask>,
+    entropy: behavior::Control,
 }
 
 type IngressTask =
@@ -64,7 +64,10 @@ impl App {
         };
         let mut swarm = SwarmBuilder::with_tokio_executor(transport, app, id).build();
         let mut ingress = mpsc::unbounded_channel();
-        let control = AppControl { ingress: ingress.0 };
+        let control = AppControl {
+            ingress: ingress.0,
+            entropy: behavior::Control::new(id, keypair),
+        };
         let name = name.to_string();
         let handle = spawn(async move {
             tracing::trace!("launch app event looop");

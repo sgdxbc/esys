@@ -398,17 +398,17 @@ impl Config {
 
 fn main() {
     let config = Config {
-        churn_rate: 0.1,
+        churn_rate: 36.5,
         node_count: 10000,
-        duration: 10,
-        faulty_rate: 0.,
+        duration: 1,
+        faulty_rate: 0.33,
         object_count: 100,
         chunk_n: 100,
         chunk_k: 80,
-        fragment_n: 200,
-        fragment_k: 80,
+        fragment_n: 500,
+        fragment_k: 200,
         allow_data_lost: true,
-        targeted_count: 200,
+        targeted_count: 0,
     };
     let mut system = System::new(config, thread_rng());
     system.run(thread_rng());

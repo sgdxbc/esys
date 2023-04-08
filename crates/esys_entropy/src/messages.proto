@@ -3,9 +3,52 @@ syntax = "proto3";
 package behavior.proto;
 
 message Request {
-    //
+    oneof inner {
+        // without response
+        Invite invite = 1;
+        Gossip gossip = 2;
+        // with response
+        QueryFragment query_fragment = 3;
+        QueryProof query_proof = 4;
+    }
 }
 
 message Response {
-    //
+    oneof inner {
+        QueryFragmentOk query_fragment_ok = 1;
+        QueryProofOk query_proof_ok = 2;
+    }
+}
+
+message Invite {
+    bytes chunk_hash = 1;
+    uint32 fragment_index = 2;
+    repeated bytes members = 3;
+}
+
+message QueryFragment {
+    bytes chunk_hash = 1;
+    uint32 fragment_index = 2; // of sender
+    bytes proof = 3;
+}
+
+message QueryFragmentOk {
+    bytes chunk_hash = 1;
+    uint32 fragment_index = 2; // of sender
+    bytes fragment = 3;
+}
+
+message QueryProof {
+    bytes chunk_hash = 1;
+}
+
+message QueryProofOk {
+    bytes chunk_hash = 1;
+    uint32 fragment_index = 2; // of sender
+    bytes proof = 3;
+}
+
+message Gossip {
+    bytes chunk_hash = 1;
+    repeated bytes members = 2; // list of PeerId
 }
