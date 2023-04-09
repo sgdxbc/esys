@@ -15,8 +15,8 @@ use tokio::{
     time::sleep,
 };
 
-#[tokio::test(flavor = "multi_thread")]
-async fn query_all_peers() {
+#[tokio::main]
+async fn main() {
     tracing_subscriber::fmt::init();
 
     let server_keypair = Keypair::generate_ed25519();
@@ -61,8 +61,8 @@ async fn query_all_peers() {
                 if register_barrier.wait().await.is_leader() {
                     for peer_id in &*peer_ids.lock().await {
                         tracing::info!(%peer_id, "query");
-                        let result = control.query((*peer_id).into()).await;
-                        tracing::info!(?result);
+                        let result = control.query((*peer_id).into(), 3).await;
+                        tracing::info!(result = ?&result);
                     }
                 }
 
@@ -73,7 +73,6 @@ async fn query_all_peers() {
         .collect::<Vec<_>>();
 
     exit_barrier.wait().await;
-    println!("exiting");
     for peer in peers {
         peer.await.unwrap()
     }
