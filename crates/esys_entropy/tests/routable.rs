@@ -54,7 +54,7 @@ async fn query_all_peers() {
 
                 sleep(Duration::from_millis(i as u64 * 100)).await;
                 control.boostrap("/memory/1".parse().unwrap()).await;
-                sleep(Duration::from_secs(3)).await; // wait until enough peers join to form a quorum
+                sleep(Duration::from_secs(3)).await; // wait 30 * 100ms until enough peers (~30) join to form a quorum
                 control.register().await;
 
                 peer_ids.lock().await.push(peer_id);

@@ -1,6 +1,6 @@
 mod behavior;
 
-use std::{collections::HashMap, future::Future, mem::take, ops::ControlFlow};
+use std::{collections::HashMap, future::Future, ops::ControlFlow};
 
 use behavior::proto;
 use esys_wirehair::WirehairDecoder;
@@ -41,8 +41,7 @@ pub struct AppControl {
     state: ControlState,
 }
 
-type IngressTask =
-    Box<dyn FnOnce(&mut Swarm<App>, &mut Vec<(AppObserver, oneshot::Sender<()>)>) + Send>;
+type IngressTask = Box<dyn FnOnce(&mut Swarm<App>, &mut Vec<AppObserver>) + Send>;
 pub type AppObserver = Box<dyn FnMut(&ControlEvent, &mut Swarm<App>) -> ControlFlow<()> + Send>;
 pub type ControlEvent = SwarmEvent<AppEvent, HandlerErr<App>>;
 
@@ -87,16 +86,7 @@ impl App {
                     event = swarm.next() => {
                         let event = event.unwrap();
                         tracing::trace!(name, ?event);
-                        let mut notifies = Vec::new();
-                        for (mut observer, notify) in take(&mut observers) {
-                            match observer(&event, &mut swarm) {
-                                ControlFlow::Continue(()) => observers.push((observer, notify)),
-                                ControlFlow::Break(()) => notifies.push(notify),
-                            }
-                        }
-                        for notify in notifies {
-                            notify.send(()).unwrap();
-                        }
+                        observers.retain_mut(|observer| matches!(observer(&event, &mut swarm), ControlFlow::Continue(())));
                     }
                 }
             }
@@ -106,6 +96,8 @@ impl App {
 }
 
 impl AppControl {
+    // TODO generalize against `action`'s return type similar to `subscribe`?
+    // not too hard to ad-hoc an oneshot for this `FnOnce` so omit it for now
     pub fn ingress(&self, action: impl FnOnce(&mut Swarm<App>) + Send + Sync + 'static) {
         self.ingress
             .send(Box::new(|swarm, _| action(swarm)))
@@ -113,18 +105,30 @@ impl AppControl {
             .expect("app handler outlives control")
     }
 
-    pub fn subscribe(
+    pub fn subscribe<T: Send + 'static>(
         &self,
-        observer: impl FnMut(&ControlEvent, &mut Swarm<App>) -> ControlFlow<()> + Send + 'static,
-    ) -> impl Future<Output = ()> + Send + 'static {
-        let exited = oneshot::channel();
+        mut observer: impl FnMut(&ControlEvent, &mut Swarm<App>) -> ControlFlow<T> + Send + 'static,
+    ) -> impl Future<Output = T> + Send + 'static {
+        let (result_in, result_out) = oneshot::channel();
+        let mut result_in = Some(result_in);
         self.ingress
             .send(Box::new(|_, observers| {
-                observers.push((Box::new(observer), exited.0))
+                observers.push(Box::new(move |event, swarm| match observer(event, swarm) {
+                    ControlFlow::Break(result) => {
+                        result_in
+                            .take()
+                            .unwrap()
+                            .send(result)
+                            .map_err(|_| ())
+                            .expect("app handler outlives control");
+                        ControlFlow::Break(())
+                    }
+                    ControlFlow::Continue(()) => ControlFlow::Continue(()),
+                }))
             }))
             .map_err(|_| ())
             .expect("app handler outlives control");
-        async move { exited.1.await.unwrap() }
+        async move { result_out.await.unwrap() }
     }
 
     pub fn listen_on(&self, addr: Multiaddr) {
@@ -144,7 +148,7 @@ impl AppControl {
                     swarm.add_external_address(address, AddressScore::Infinite);
                 }
             }
-            ControlFlow::Continue(())
+            ControlFlow::<()>::Continue(())
         });
         drop(s);
     }
@@ -165,7 +169,7 @@ impl AppControl {
                         .to_owned(),
                 );
             }
-            ControlFlow::Continue(())
+            ControlFlow::<()>::Continue(())
         });
         drop(s);
     }
