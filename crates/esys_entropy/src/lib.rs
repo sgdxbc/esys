@@ -293,10 +293,9 @@ impl AppHandle {
             })) if *id == get_id => {
                 let result = match result {
                     Ok(GetRecordOk::FoundRecord(result)) => {
-                        if let Some(mut query) = swarm
-                            .behaviour_mut()
-                            .kad
-                            .query_mut(id) { query.finish() }
+                        if let Some(mut query) = swarm.behaviour_mut().kad.query_mut(id) {
+                            query.finish()
+                        }
                         Some(Multiaddr::try_from(result.record.value.clone()).unwrap())
                     }
                     Err(GetRecordError::NotFound { .. }) => None,
@@ -376,19 +375,13 @@ pub struct AppControl {
     id: PeerId,
     keypair: Keypair,
     chunks: HashMap<Multihash, Chunk>,
-    peers: HashMap<PeerId, Info>,
+    peers: HashMap<PeerId, PeerInfo>,
 }
 
-impl AppControl {
-    pub fn new(handle: AppHandle, id: PeerId, keypair: Keypair) -> Self {
-        Self {
-            handle,
-            chunks: Default::default(),
-            peers: Default::default(),
-            id,
-            keypair,
-        }
-    }
+enum PeerInfo {
+    Queried(Multiaddr),
+    Identifying(Multiaddr, oneshot::Sender<()>),
+    Identified(Info),
 }
 
 #[derive(Debug)]
@@ -406,6 +399,37 @@ enum Fragment {
 }
 
 impl AppControl {
+    pub fn new(handle: AppHandle, id: PeerId, keypair: Keypair) -> Self {
+        Self {
+            handle,
+            chunks: Default::default(),
+            peers: Default::default(),
+            id,
+            keypair,
+        }
+    }
+
+    async fn query_address(&mut self, peer_id: PeerId) -> Option<Multiaddr> {
+        match self.peers.get(&peer_id) {
+            Some(PeerInfo::Queried(addr)) | Some(PeerInfo::Identifying(addr, _)) => {
+                return Some(addr.clone())
+            }
+            Some(PeerInfo::Identified(info)) => {
+                return info
+                    .listen_addrs
+                    .iter()
+                    .find(|addr| is_global(addr))
+                    .cloned()
+            }
+            _ => {}
+        }
+        let addr = self.handle.query_address(peer_id).await;
+        if let Some(addr) = &addr {
+            self.peers.insert(peer_id, PeerInfo::Queried(addr.clone()));
+        }
+        addr
+    }
+
     // entropy message flow
     // precondition: a group of peers that hold identical `members` view
     // invariant: every peer in `members` can be queried for one fragment
@@ -445,15 +469,12 @@ impl AppControl {
     pub async fn invite(&self, chunk_hash: Multihash, index: u32) {
         let chunk = &self.chunks[&chunk_hash];
         // TODO check watermarks
-        if chunk.proofs.contains_key(&index) {
-            return;
-        }
-        let fragment_hash = Self::fragment_hash(chunk_hash, index);
-        let peers = self
+        assert!(!chunk.proofs.contains_key(&index));
+        for (peer_id, peer_addr) in self
             .handle
-            .query(fragment_hash, 1) // TODO configure this
-            .await;
-        for (peer_id, peer_addr) in peers {
+            .query(Self::fragment_hash(chunk_hash, index), 1) // TODO configure this
+            .await
+        {
             if chunk.members.contains_key(&peer_id) {
                 continue;
             }
@@ -468,6 +489,11 @@ impl AppControl {
                 })),
             };
             self.handle.ingress(move |swarm| {
+                // silly way to prevent duplicated address get recorded and becomes potential overhead
+                swarm
+                    .behaviour_mut()
+                    .entropy
+                    .remove_address(&peer_id, &peer_addr);
                 swarm
                     .behaviour_mut()
                     .entropy
@@ -572,7 +598,9 @@ impl AppControl {
     fn verify(&self, chunk_hash: Multihash, index: u32, peer_id: PeerId, proof: &[u8]) -> bool {
         let mut input = chunk_hash.to_bytes();
         input.extend(&index.to_be_bytes());
-        self.peers[&peer_id].public_key.verify(&input, proof)
-            && Self::accepted(chunk_hash, index, peer_id, proof)
+        let Some(PeerInfo::Identified(info)) = self.peers.get(&peer_id) else {
+            unimplemented!()
+        };
+        info.public_key.verify(&input, proof) && Self::accepted(chunk_hash, index, peer_id, proof)
     }
 }
