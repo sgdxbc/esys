@@ -38,7 +38,7 @@ pub struct App {
 }
 
 #[derive(Clone)]
-pub struct AppControl {
+pub struct AppHandle {
     ingress: mpsc::UnboundedSender<IngressTask>,
     // state: ControlState,
 }
@@ -52,7 +52,7 @@ impl App {
         name: impl ToString,
         transport: transport::Boxed<(PeerId, StreamMuxerBox)>,
         keypair: Keypair,
-    ) -> (JoinHandle<Swarm<Self>>, AppControl) {
+    ) -> (JoinHandle<Swarm<Self>>, AppHandle) {
         let id = PeerId::from_public_key(&keypair.public());
         let app = Self {
             identify: identify::Behaviour::new(identify::Config::new(
@@ -68,7 +68,7 @@ impl App {
         };
         let mut swarm = SwarmBuilder::with_tokio_executor(transport, app, id).build();
         let mut ingress = mpsc::unbounded_channel();
-        let control = AppControl {
+        let control = AppHandle {
             ingress: ingress.0,
             // state: ControlState::new(id, keypair),
         };
@@ -97,14 +97,21 @@ impl App {
     }
 }
 
-impl AppControl {
-    // TODO generalize against `action`'s return type similar to `subscribe`?
-    // not too hard to ad-hoc an oneshot for this `FnOnce` so omit it for now
+impl AppHandle {
     pub fn ingress(&self, action: impl FnOnce(&mut Swarm<App>) + Send + Sync + 'static) {
         self.ingress
             .send(Box::new(|swarm, _| action(swarm)))
             .map_err(|_| ())
             .expect("app handler outlives control")
+    }
+
+    pub fn ingress_wait<T: Send + 'static>(
+        &self,
+        action: impl FnOnce(&mut Swarm<App>) -> T + Send + Sync + 'static,
+    ) -> impl Future<Output = T> + Send + 'static {
+        let result = oneshot::channel();
+        self.ingress(move |swarm| result.0.send(action(swarm)).map_err(|_| ()).unwrap());
+        async { result.1.await.unwrap() }
     }
 
     pub fn subscribe<T: Send + 'static>(
@@ -237,23 +244,18 @@ impl AppControl {
     }
 
     pub async fn register(&self) {
-        let put_id = oneshot::channel();
-        self.ingress(move |swarm| {
-            let addr = &swarm.external_addresses().next().unwrap().addr;
-            tracing::debug!(peer_id = %swarm.local_peer_id(), %addr, "register");
-            let record = Record::new(swarm.local_peer_id().to_bytes(), addr.to_vec());
-            put_id
-                .0
-                .send(
-                    swarm
-                        .behaviour_mut()
-                        .kad
-                        .put_record(record, Quorum::All)
-                        .unwrap(),
-                )
-                .unwrap();
-        });
-        let put_id = put_id.1.await.unwrap();
+        let put_id = self
+            .ingress_wait(move |swarm| {
+                let addr = &swarm.external_addresses().next().unwrap().addr;
+                tracing::debug!(peer_id = %swarm.local_peer_id(), %addr, "register");
+                let record = Record::new(swarm.local_peer_id().to_bytes(), addr.to_vec());
+                swarm
+                    .behaviour_mut()
+                    .kad
+                    .put_record(record, Quorum::All)
+                    .unwrap()
+            })
+            .await;
         self.subscribe(move |event, _| match event {
             SwarmEvent::Behaviour(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
                 id,
@@ -274,19 +276,14 @@ impl AppControl {
     }
 
     pub async fn query_address(&self, peer_id: PeerId) -> Option<Multiaddr> {
-        let get_id = oneshot::channel();
-        self.ingress(move |swarm| {
-            get_id
-                .0
-                .send(
-                    swarm
-                        .behaviour_mut()
-                        .kad
-                        .get_record(Key::new(&peer_id.to_bytes())),
-                )
-                .unwrap()
-        });
-        let get_id = get_id.1.await.unwrap();
+        let get_id = self
+            .ingress_wait(move |swarm| {
+                swarm
+                    .behaviour_mut()
+                    .kad
+                    .get_record(Key::new(&peer_id.to_bytes()))
+            })
+            .await;
         // tracing::debug!(%peer_id, ?get_id);
         self.subscribe(move |event, swarm| match event {
             Behavior(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
@@ -296,11 +293,10 @@ impl AppControl {
             })) if *id == get_id => {
                 let result = match result {
                     Ok(GetRecordOk::FoundRecord(result)) => {
-                        swarm
+                        if let Some(mut query) = swarm
                             .behaviour_mut()
                             .kad
-                            .query_mut(id)
-                            .map(|mut query| query.finish());
+                            .query_mut(id) { query.finish() }
                         Some(Multiaddr::try_from(result.record.value.clone()).unwrap())
                     }
                     Err(GetRecordError::NotFound { .. }) => None,
@@ -315,14 +311,9 @@ impl AppControl {
 
     // given a key (e.g. hash of encoded fragment), find closest peers' id and address
     pub async fn query(&self, key: Multihash, n: usize) -> Vec<(PeerId, Option<Multiaddr>)> {
-        let find_id = oneshot::channel();
-        self.ingress(move |swarm| {
-            find_id
-                .0
-                .send(swarm.behaviour_mut().kad.get_closest_peers(key))
-                .unwrap()
-        });
-        let find_id = find_id.1.await.unwrap();
+        let find_id = self
+            .ingress_wait(move |swarm| swarm.behaviour_mut().kad.get_closest_peers(key))
+            .await;
         let peers = self
             .subscribe(move |event, swarm| match event {
                 SwarmEvent::Behaviour(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
@@ -380,17 +371,18 @@ fn is_global(addr: &Multiaddr) -> bool {
     }
 }
 
-#[derive(Debug)]
-struct ControlState {
-    chunks: HashMap<Multihash, Chunk>,
-    peers: HashMap<PeerId, Info>,
+pub struct AppControl {
+    pub handle: AppHandle,
     id: PeerId,
     keypair: Keypair,
+    chunks: HashMap<Multihash, Chunk>,
+    peers: HashMap<PeerId, Info>,
 }
 
-impl ControlState {
-    pub fn new(id: PeerId, keypair: Keypair) -> Self {
+impl AppControl {
+    pub fn new(handle: AppHandle, id: PeerId, keypair: Keypair) -> Self {
         Self {
+            handle,
             chunks: Default::default(),
             peers: Default::default(),
             id,
@@ -413,170 +405,174 @@ enum Fragment {
     Complete(Vec<u8>),
 }
 
-// impl AppControl {
-//     // entropy message flow
-//     // precondition: a group of peers that hold identical `members` view
-//     // invariant: every peer in `members` can be queried for one fragment
-//     // 1. some group member INVITE a new peer, with current `members`
-//     // 2. if the new peer proves itself, it broadcasts QUERY_FRAGMENT to `members`
-//     // 3. sufficient peers from `members` verify the new peer's proof and reply QUERY_FRAGMENT_OK with local fragment
-//     // 4. new peer finish recovering and generating its fragment, broadcast GOSSIP to `members`
-//     // 5. `members` peers insert the new peer into local `members` view, start to GOSSIP to the new peer
-//     //   5.1. if a member peer has not received the new peer's proof upon heard about the new peer, it sends QUERY_PROOF
-//     //   to new peer and insert the new peer into local `members` when receiving QUERY_PROOF_OK
-//     //
-//     // how to INVITE
-//     // on invite timer
-//     // 1. update members' liveness knowledge base on received GOSSIP
-//     // 2. in range `low_watermark..<highest taken fragment index>`, INVITE on every index that is not taken
-//     // 3. keep INVITE on increamentally even higher fragment index until sufficient fragment indexes are taken by unique
-//     // members
-//     // 4. (after all INVITE done) reset <highest taken fragment index> to the `group_size`th lowest taken fragment index
-//     // (above low watermark)
+impl AppControl {
+    // entropy message flow
+    // precondition: a group of peers that hold identical `members` view
+    // invariant: every peer in `members` can be queried for one fragment
+    // 1. some group member INVITE a new peer, with current `members`
+    // 2. if the new peer proves itself, it broadcasts QUERY_FRAGMENT to `members`
+    // 3. sufficient peers from `members` verify the new peer's proof and reply QUERY_FRAGMENT_OK with local fragment
+    // 4. new peer finish recovering and generating its fragment, broadcast GOSSIP to `members`
+    // 5. `members` peers insert the new peer into local `members` view, start to GOSSIP to the new peer
+    //   5.1. if a member peer has not received the new peer's proof upon heard about the new peer, it sends QUERY_PROOF
+    //   to new peer and insert the new peer into local `members` when receiving QUERY_PROOF_OK
+    //
+    // how to INVITE
+    // on invite timer
+    // 1. update members' liveness knowledge base on received GOSSIP
+    // 2. in range `low_watermark..<highest taken fragment index>`, INVITE on every index that is not taken
+    // 3. keep INVITE on increamentally even higher fragment index until sufficient fragment indexes are taken by unique
+    // members
+    // 4. (after all INVITE done) reset <highest taken fragment index> to the `group_size`th lowest taken fragment index
+    // (above low watermark)
 
-//     pub fn gossip(&self, chunk_hash: Multihash) {
-//         let members = &self.state.chunks[&chunk_hash].members;
-//         let request = proto::Request {
-//             inner: Some(proto::request::Inner::Gossip(proto::Gossip {
-//                 chunk_hash: chunk_hash.to_bytes(),
-//                 members: members.keys().map(PeerId::to_bytes).collect(),
-//             })),
-//         };
-//         for &peer in members.keys() {
-//             let request = request.clone();
-//             self.ingress(move |swarm| {
-//                 swarm.behaviour_mut().entropy.send_request(&peer, request);
-//             });
-//         }
-//     }
+    pub fn gossip(&self, chunk_hash: Multihash) {
+        let members = &self.chunks[&chunk_hash].members;
+        let request = proto::Request {
+            inner: Some(proto::request::Inner::Gossip(proto::Gossip {
+                chunk_hash: chunk_hash.to_bytes(),
+                members: members.keys().map(PeerId::to_bytes).collect(),
+            })),
+        };
+        for &peer in members.keys() {
+            let request = request.clone();
+            self.handle.ingress(move |swarm| {
+                swarm.behaviour_mut().entropy.send_request(&peer, request);
+            });
+        }
+    }
 
-//     pub async fn invite(&self, chunk_hash: Multihash, index: u32) {
-//         let chunk = &self.state.chunks[&chunk_hash];
-//         // TODO check watermarks
-//         if chunk.proofs.contains_key(&index) {
-//             return;
-//         }
-//         let fragment_hash = Self::fragment_hash(chunk_hash, index);
-//         // TODO try invite multiple peers
-//         let (peer_id, peer_addr) = self
-//             .query(fragment_hash)
-//             .await
-//             .expect("found peer to invite");
-//         if chunk.members.contains_key(&peer_id) {
-//             return;
-//         }
-//         let request = proto::Request {
-//             inner: Some(proto::request::Inner::Invite(proto::Invite {
-//                 chunk_hash: chunk_hash.to_bytes(),
-//                 fragment_index: index,
-//                 members: chunk.members.keys().map(PeerId::to_bytes).collect(),
-//             })),
-//         };
-//         self.ingress(move |swarm| {
-//             swarm
-//                 .behaviour_mut()
-//                 .entropy
-//                 .add_address(&peer_id, peer_addr);
-//             swarm
-//                 .behaviour_mut()
-//                 .entropy
-//                 .send_request(&peer_id, request);
-//         });
-//     }
+    pub async fn invite(&self, chunk_hash: Multihash, index: u32) {
+        let chunk = &self.chunks[&chunk_hash];
+        // TODO check watermarks
+        if chunk.proofs.contains_key(&index) {
+            return;
+        }
+        let fragment_hash = Self::fragment_hash(chunk_hash, index);
+        let peers = self
+            .handle
+            .query(fragment_hash, 1) // TODO configure this
+            .await;
+        for (peer_id, peer_addr) in peers {
+            if chunk.members.contains_key(&peer_id) {
+                continue;
+            }
+            let Some(peer_addr) = peer_addr else {
+                continue;
+            };
+            let request = proto::Request {
+                inner: Some(proto::request::Inner::Invite(proto::Invite {
+                    chunk_hash: chunk_hash.to_bytes(),
+                    fragment_index: index,
+                    members: chunk.members.keys().map(PeerId::to_bytes).collect(),
+                })),
+            };
+            self.handle.ingress(move |swarm| {
+                swarm
+                    .behaviour_mut()
+                    .entropy
+                    .add_address(&peer_id, peer_addr);
+                swarm
+                    .behaviour_mut()
+                    .entropy
+                    .send_request(&peer_id, request);
+            });
+        }
+    }
 
-//     pub async fn handle_invite(&self, message: proto::Invite) {
-//         let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
-//         if self.state.chunks.contains_key(&chunk_hash) {
-//             return; //
-//         }
-//         let Some(proof) = self.prove(chunk_hash, message.fragment_index) else {
-//             //
-//             return;
-//         };
-//         let mut chunk = Chunk {
-//             fragment_index: message.fragment_index,
-//             fragment: Fragment::Incomplete(Mutex::new(WirehairDecoder::new(0, 0))), //
-//             members: Default::default(),
-//             proofs: Default::default(),
-//         };
-//         chunk.members.insert(self.state.id, message.fragment_index);
-//         chunk
-//             .proofs
-//             .insert(message.fragment_index, (self.state.id, proof.clone()));
-//         // TODO
-//     }
+    pub async fn handle_invite(&self, message: proto::Invite) {
+        let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
+        if self.chunks.contains_key(&chunk_hash) {
+            return; //
+        }
+        let Some(proof) = self.prove(chunk_hash, message.fragment_index) else {
+            //
+            return;
+        };
+        let mut chunk = Chunk {
+            fragment_index: message.fragment_index,
+            fragment: Fragment::Incomplete(Mutex::new(WirehairDecoder::new(0, 0))), //
+            members: Default::default(),
+            proofs: Default::default(),
+        };
+        chunk.members.insert(self.id, message.fragment_index);
+        chunk
+            .proofs
+            .insert(message.fragment_index, (self.id, proof));
+        // TODO
+    }
 
-//     pub fn handle_query_fragment(
-//         &self,
-//         peer_id: PeerId,
-//         message: proto::QueryFragment,
-//     ) -> Option<proto::QueryFragmentOk> {
-//         let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
-//         let Some(chunk) = self.state.chunks.get(&chunk_hash) else {
-//             //
-//             return None;
-//         };
+    pub fn handle_query_fragment(
+        &self,
+        peer_id: PeerId,
+        message: proto::QueryFragment,
+    ) -> Option<proto::QueryFragmentOk> {
+        let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
+        let Some(chunk) = self.chunks.get(&chunk_hash) else {
+            //
+            return None;
+        };
 
-//         if !self.verify(chunk_hash, message.fragment_index, peer_id, &message.proof) {
-//             //
-//             return None;
-//         }
+        if !self.verify(chunk_hash, message.fragment_index, peer_id, &message.proof) {
+            //
+            return None;
+        }
 
-//         let Fragment::Complete(fragment) = &chunk.fragment else {
-//             panic!("receive query fragment before sending gossip")
-//         };
-//         let response = proto::QueryFragmentOk {
-//             chunk_hash: message.chunk_hash,
-//             fragment_index: chunk.fragment_index,
-//             fragment: fragment.clone(),
-//         };
-//         Some(response)
-//     }
+        let Fragment::Complete(fragment) = &chunk.fragment else {
+            panic!("receive query fragment before sending gossip")
+        };
+        let response = proto::QueryFragmentOk {
+            chunk_hash: message.chunk_hash,
+            fragment_index: chunk.fragment_index,
+            fragment: fragment.clone(),
+        };
+        Some(response)
+    }
 
-//     // TODO homomorphic hashing
-//     fn fragment_hash(chunk_hash: Multihash, index: u32) -> Multihash {
-//         let mut input = chunk_hash.to_bytes();
-//         input.extend(&index.to_be_bytes());
-//         Code::Sha2_256.digest(&input)
-//     }
+    // TODO homomorphic hashing
+    fn fragment_hash(chunk_hash: Multihash, index: u32) -> Multihash {
+        let mut input = chunk_hash.to_bytes();
+        input.extend(&index.to_be_bytes());
+        Code::Sha2_256.digest(&input)
+    }
 
-//     fn accept_probablity(chunk_hash: Multihash, index: u32, peer_id: PeerId) -> f64 {
-//         let fragment_hash = Self::fragment_hash(chunk_hash, index);
-//         let distance = kbucket::Key::from(fragment_hash).distance(&kbucket::Key::from(peer_id));
-//         // TODO tune the probability distribution properly
-//         match distance.ilog2() {
-//             None => 0.95,
-//             Some(i) if i <= 18 => 0.9 - 0.05 * i as f64,
-//             _ => 0.,
-//         }
-//     }
+    fn accept_probablity(chunk_hash: Multihash, index: u32, peer_id: PeerId) -> f64 {
+        let fragment_hash = Self::fragment_hash(chunk_hash, index);
+        let distance = kbucket::Key::from(fragment_hash).distance(&kbucket::Key::from(peer_id));
+        // TODO tune the probability distribution properly
+        match distance.ilog2() {
+            None => 0.95,
+            Some(i) if i <= 18 => 0.9 - 0.05 * i as f64,
+            _ => 0.,
+        }
+    }
 
-//     fn accepted(chunk_hash: Multihash, index: u32, peer_id: PeerId, proof: &[u8]) -> bool {
-//         let seed = {
-//             let mut hasher = Sha2_256::default();
-//             hasher.update(proof);
-//             hasher.finalize().try_into().unwrap()
-//         };
-//         StdRng::from_seed(seed).gen_bool(Self::accept_probablity(chunk_hash, index, peer_id))
-//     }
+    fn accepted(chunk_hash: Multihash, index: u32, peer_id: PeerId, proof: &[u8]) -> bool {
+        let seed = {
+            let mut hasher = Sha2_256::default();
+            hasher.update(proof);
+            hasher.finalize().try_into().unwrap()
+        };
+        StdRng::from_seed(seed).gen_bool(Self::accept_probablity(chunk_hash, index, peer_id))
+    }
 
-//     fn prove(&self, chunk_hash: Multihash, index: u32) -> Option<Vec<u8>> {
-//         let proof = {
-//             let mut input = chunk_hash.to_bytes();
-//             input.extend(&index.to_be_bytes());
-//             self.state.keypair.sign(&input).unwrap()
-//         };
-//         if Self::accepted(chunk_hash, index, self.state.id, &proof) {
-//             Some(proof)
-//         } else {
-//             None
-//         }
-//     }
+    fn prove(&self, chunk_hash: Multihash, index: u32) -> Option<Vec<u8>> {
+        let proof = {
+            let mut input = chunk_hash.to_bytes();
+            input.extend(&index.to_be_bytes());
+            self.keypair.sign(&input).unwrap()
+        };
+        if Self::accepted(chunk_hash, index, self.id, &proof) {
+            Some(proof)
+        } else {
+            None
+        }
+    }
 
-//     fn verify(&self, chunk_hash: Multihash, index: u32, peer_id: PeerId, proof: &[u8]) -> bool {
-//         let mut input = chunk_hash.to_bytes();
-//         input.extend(&index.to_be_bytes());
-//         self.state.peers[&peer_id].public_key.verify(&input, proof)
-//             && Self::accepted(chunk_hash, index, peer_id, proof)
-//     }
-// }
+    fn verify(&self, chunk_hash: Multihash, index: u32, peer_id: PeerId, proof: &[u8]) -> bool {
+        let mut input = chunk_hash.to_bytes();
+        input.extend(&index.to_be_bytes());
+        self.peers[&peer_id].public_key.verify(&input, proof)
+            && Self::accepted(chunk_hash, index, peer_id, proof)
+    }
+}

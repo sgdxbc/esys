@@ -1,7 +1,7 @@
 use std::{mem::take, net::Ipv4Addr, time::Duration};
 
 use clap::Parser;
-use esys_entropy::{App, AppControl};
+use esys_entropy::{App, AppHandle};
 use libp2p::{
     core::upgrade::Version::V1,
     identity::Keypair,
@@ -67,7 +67,7 @@ async fn main() {
     }
 }
 
-fn start_app(cli: &Cli) -> (JoinHandle<Swarm<App>>, AppControl) {
+fn start_app(cli: &Cli) -> (JoinHandle<Swarm<App>>, AppHandle) {
     let id_keys = Keypair::generate_ed25519();
     let transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
         .upgrade(V1)
