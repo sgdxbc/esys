@@ -1,6 +1,6 @@
 mod behavior;
 
-use std::{collections::HashMap, future::Future, ops::ControlFlow};
+use std::{collections::HashMap, future::Future, mem::replace, ops::ControlFlow};
 
 use behavior::proto;
 use esys_wirehair::WirehairDecoder;
@@ -15,7 +15,7 @@ use libp2p::{
     },
     multiaddr,
     multihash::{Code, Hasher, Multihash, MultihashDigest, Sha2_256},
-    request_response::{ProtocolSupport, RequestId},
+    request_response::{ProtocolSupport, RequestId, ResponseChannel},
     swarm::{
         AddressScore, NetworkBehaviour as NetworkBehavior, SwarmBuilder,
         SwarmEvent::{self, Behaviour as Behavior},
@@ -391,8 +391,8 @@ pub struct AppControl {
 struct Chunk {
     fragment_index: u32,
     fragment: Fragment,
-    members: HashMap<PeerId, (u32, Multiaddr)>,
-    proofs: HashMap<u32, (PeerId, Vec<u8>)>,
+    members: HashMap<PublicKey, (u32, Multiaddr)>,
+    proofs: HashMap<u32, (PublicKey, Vec<u8>)>,
 }
 
 #[derive(Debug)]
@@ -437,16 +437,27 @@ impl AppControl {
         let request = proto::Request {
             inner: Some(proto::request::Inner::Gossip(proto::Gossip {
                 chunk_hash: chunk_hash.to_bytes(),
-                members: chunk.to_members(),
+                members: chunk.gossip_members(),
             })),
         };
-        for &peer in chunk.members.keys() {
+        for peer_key in chunk.members.keys() {
+            let peer_id = PeerId::from_public_key(peer_key);
+            if peer_id == self.id {
+                continue;
+            }
             let request = request.clone();
             self.handle.ingress(move |swarm| {
                 // invariant: every peer in `members` must have `add_address` upon inserting
-                swarm.behaviour_mut().entropy.send_request(&peer, request);
+                swarm
+                    .behaviour_mut()
+                    .entropy
+                    .send_request(&peer_id, request);
             });
         }
+    }
+
+    pub fn handle_gossip(&self, message: &proto::Gossip) {
+        //
     }
 
     pub async fn invite(&self, chunk_hash: Multihash, index: u32) {
@@ -458,9 +469,9 @@ impl AppControl {
             .query(Self::fragment_hash(chunk_hash, index), 1) // TODO configure this
             .await
         {
-            if chunk.members.contains_key(&peer_id) {
-                continue;
-            }
+            // if chunk.members.contains_key(&peer_id) {
+            //     continue;
+            // }
             let Some(peer_addr) = peer_addr else {
                 continue;
             };
@@ -468,7 +479,7 @@ impl AppControl {
                 inner: Some(proto::request::Inner::Invite(proto::Invite {
                     chunk_hash: chunk_hash.to_bytes(),
                     fragment_index: index,
-                    members: chunk.to_members(),
+                    members: chunk.invite_members(),
                 })),
             };
             self.handle.ingress(move |swarm| {
@@ -479,7 +490,7 @@ impl AppControl {
         }
     }
 
-    pub async fn handle_invite(&mut self, message: proto::Invite) {
+    pub async fn handle_invite(&mut self, message: &proto::Invite) {
         let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
         if self.chunks.contains_key(&chunk_hash) {
             return; //
@@ -495,64 +506,206 @@ impl AppControl {
             members: Default::default(),
             proofs: Default::default(),
         };
-        chunk
-            .members
-            .insert(self.id, (message.fragment_index, self.addr.clone()));
-        chunk
-            .proofs
-            .insert(message.fragment_index, (self.id, proof.clone()));
-        self.chunks.insert(chunk_hash, chunk);
+        for member in &message.members {
+            let peer_id = PeerId::from_bytes(&member.id).unwrap();
+            let public_key = PublicKey::from_protobuf_encoding(&member.public_key).unwrap();
+            if !self.verify(
+                chunk_hash,
+                member.index,
+                peer_id,
+                &public_key,
+                &member.proof,
+            ) {
+                //
+                continue;
+            }
+            // TODO one peer multiple index / multiple peer one index
+            chunk.members.insert(
+                public_key.clone(),
+                (
+                    member.index,
+                    Multiaddr::try_from(member.addr.clone()).unwrap(),
+                ),
+            );
+            chunk
+                .proofs
+                .insert(member.index, (public_key, member.proof.clone()));
+        }
+        // TODO less than k
+        if chunk.proofs.len() < 10 {
+            //
+            return;
+        }
+        chunk.members.insert(
+            self.keypair.public(),
+            (message.fragment_index, self.addr.clone()),
+        );
+        chunk.proofs.insert(
+            message.fragment_index,
+            (self.keypair.public(), proof.clone()),
+        );
 
         let request = proto::Request {
             inner: Some(proto::request::Inner::QueryFragment(proto::QueryFragment {
                 chunk_hash: message.chunk_hash.clone(),
-                fragment_index: message.fragment_index,
-                public_key: self.keypair.public().to_protobuf_encoding(),
-                proof,
+                member: Some(proto::Member {
+                    id: self.id.to_bytes(),
+                    addr: self.addr.to_vec(),
+                    index: message.fragment_index,
+                    public_key: self.keypair.public().to_protobuf_encoding(),
+                    proof,
+                }),
             })),
         };
-        self.handle.ingress(move |swarm| {
-            for member in message.members {
-                swarm.behaviour_mut().send_request_with_addr(
-                    &PeerId::from_bytes(&member.id).unwrap(),
-                    Multiaddr::try_from(member.addr).unwrap(),
-                    request.clone(),
-                );
-            }
-        });
+        for (peer_key, (_, addr)) in &chunk.members {
+            let peer_id = PeerId::from_public_key(peer_key);
+            let addr = addr.clone();
+            let request = request.clone();
+            self.handle.ingress(move |swarm| {
+                swarm
+                    .behaviour_mut()
+                    .send_request_with_addr(&peer_id, addr, request);
+            });
+        }
+
+        self.chunks.insert(chunk_hash, chunk);
     }
 
     pub fn handle_query_fragment(
         &self,
-        peer_id: PeerId,
-        message: proto::QueryFragment,
-    ) -> Option<proto::QueryFragmentOk> {
+        message: &proto::QueryFragment,
+        channel: ResponseChannel<proto::Response>,
+    ) {
         let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
         let Some(chunk) = self.chunks.get(&chunk_hash) else {
             //
-            return None;
+            return;
         };
 
+        let member = message.member.as_ref().unwrap();
         if !self.verify(
             chunk_hash,
-            message.fragment_index,
-            peer_id,
-            &PublicKey::from_protobuf_encoding(&message.public_key).unwrap(),
-            &message.proof,
+            member.index,
+            PeerId::from_bytes(&member.id).unwrap(),
+            &PublicKey::from_protobuf_encoding(&member.public_key).unwrap(),
+            &member.proof,
         ) {
             //
-            return None;
+            return;
         }
 
         let Fragment::Complete(fragment) = &chunk.fragment else {
             panic!("receive query fragment before sending gossip")
         };
-        let response = proto::QueryFragmentOk {
-            chunk_hash: message.chunk_hash,
-            fragment_index: chunk.fragment_index,
-            fragment: fragment.clone(),
+        let response = proto::Response {
+            inner: Some(proto::response::Inner::QueryFragmentOk(
+                proto::QueryFragmentOk {
+                    chunk_hash: message.chunk_hash.clone(),
+                    fragment_index: chunk.fragment_index,
+                    fragment: fragment.clone(),
+                },
+            )),
         };
-        Some(response)
+        self.handle.ingress(move |swarm| {
+            swarm
+                .behaviour_mut()
+                .entropy
+                .send_response(channel, response)
+                .unwrap();
+        });
+    }
+
+    pub fn handle_query_fragment_ok(&mut self, message: &proto::QueryFragmentOk) {
+        let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
+        let Some(chunk) = self.chunks.get_mut(&chunk_hash) else {
+            //
+            return;
+        };
+        let Fragment::Incomplete(decoder) = &mut chunk.fragment else {
+            //
+            return;
+        };
+
+        let recovered = decoder
+            .get_mut()
+            .decode(message.fragment_index, &message.fragment)
+            .unwrap();
+        if !recovered {
+            return;
+        }
+
+        // replace with a placeholder
+        let Fragment::Incomplete(decoder) = replace(&mut chunk.fragment, Fragment::Complete(Default::default())) else {
+            unreachable!()
+        };
+        let mut fragment = vec![0; 0]; //
+        decoder
+            .into_inner()
+            .into_encoder()
+            .unwrap()
+            .encode(chunk.fragment_index, &mut fragment)
+            .unwrap();
+        let _ = replace(&mut chunk.fragment, Fragment::Complete(fragment));
+
+        self.gossip(chunk_hash); // set a timer here?
+    }
+
+    pub fn handle_query_proof(
+        &self,
+        message: &proto::QueryProof,
+        channel: ResponseChannel<proto::Response>,
+    ) {
+        let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
+        let Some(chunk) = self.chunks.get(&chunk_hash) else {
+            //
+            return;
+        };
+        let response = proto::Response {
+            inner: Some(proto::response::Inner::QueryProofOk(proto::QueryProofOk {
+                chunk_hash: message.chunk_hash.clone(),
+                member: Some(proto::Member {
+                    index: chunk.fragment_index,
+                    public_key: self.keypair.public().to_protobuf_encoding(),
+                    proof: chunk.proofs[&chunk.fragment_index].1.clone(),
+                    addr: self.addr.to_vec(),
+                    id: self.id.to_bytes(),
+                }),
+            })),
+        };
+        self.handle.ingress(move |swarm| {
+            swarm
+                .behaviour_mut()
+                .entropy
+                .send_response(channel, response)
+                .unwrap();
+        });
+    }
+
+    pub fn handle_query_proof_ok(&mut self, message: &proto::QueryProofOk) {
+        let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
+        if !self.chunks.contains_key(&chunk_hash) {
+            //
+            return;
+        }
+        let member = message.member.as_ref().unwrap();
+        let public_key = PublicKey::from_protobuf_encoding(&member.public_key).unwrap();
+        let peer_id = PeerId::from_bytes(&member.id).unwrap();
+        if !self.verify(
+            chunk_hash,
+            member.index,
+            peer_id,
+            &public_key,
+            &member.proof,
+        ) {
+            //
+            return;
+        }
+        // chunk.members.insert(peer_id, (message.fragment_index, message.add))
+        self.chunks
+            .get_mut(&chunk_hash)
+            .unwrap()
+            .proofs
+            .insert(member.index, (public_key, member.proof.clone()));
     }
 
     // TODO homomorphic hashing
@@ -603,6 +756,7 @@ impl AppControl {
         public_key: &PublicKey,
         proof: &[u8],
     ) -> bool {
+        // TODO check high/low watermark?
         let mut input = chunk_hash.to_bytes();
         input.extend(&index.to_be_bytes());
         peer_id.is_public_key(public_key).unwrap()
@@ -612,13 +766,29 @@ impl AppControl {
 }
 
 impl Chunk {
-    fn to_members(&self) -> Vec<proto::Member> {
+    fn gossip_members(&self) -> Vec<proto::Member> {
         self.members
             .iter()
-            .map(|(id, (index, addr))| proto::Member {
+            .map(|(key, (index, addr))| proto::Member {
                 index: *index,
-                id: id.to_bytes(),
+                id: PeerId::from_public_key(key).to_bytes(),
                 addr: addr.to_vec(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    // duplicated code
+    // i don't fucking care
+    fn invite_members(&self) -> Vec<proto::Member> {
+        self.members
+            .iter()
+            .map(|(key, (index, addr))| proto::Member {
+                index: *index,
+                id: PeerId::from_public_key(key).to_bytes(),
+                addr: addr.to_vec(),
+                public_key: key.to_protobuf_encoding(),
+                proof: self.proofs[index].1.clone(),
             })
             .collect()
     }

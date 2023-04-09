@@ -28,9 +28,7 @@ message Invite {
 
 message QueryFragment {
     bytes chunk_hash = 1;
-    uint32 fragment_index = 2; // of sender
-    bytes public_key = 3;
-    bytes proof = 4;
+    Member member = 2;
 }
 
 message QueryFragmentOk {
@@ -45,9 +43,7 @@ message QueryProof {
 
 message QueryProofOk {
     bytes chunk_hash = 1;
-    uint32 fragment_index = 2; // of sender
-    bytes public_key = 3;
-    bytes proof = 4;
+    Member member = 2;
 }
 
 message Gossip {
@@ -59,4 +55,7 @@ message Member {
     uint32 index = 1;
     bytes id = 2;
     bytes addr = 3;
+    // omitted in Gossip
+    bytes public_key = 4;
+    bytes proof = 5;
 }
