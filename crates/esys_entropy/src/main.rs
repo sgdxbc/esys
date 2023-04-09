@@ -77,7 +77,7 @@ fn start_app(cli: &Cli) -> (JoinHandle<Swarm<App>>, AppHandle) {
     let (handle, control) = App::run("", transport, id_keys);
     let mut first_addr = true;
     let ip = cli.ip;
-    control.serve_listen(move |addr| {
+    control.serve_add_external_address(move |addr| {
         addr.replace(0, |protocol| {
             assert!(matches!(protocol, Protocol::Ip4(_)));
             if take(&mut first_addr) {
@@ -87,7 +87,7 @@ fn start_app(cli: &Cli) -> (JoinHandle<Swarm<App>>, AppHandle) {
             }
         })
     });
-    control.serve_kad();
+    control.serve_kad_add_address();
     control.listen_on(multiaddr!(
         Ip4(0),
         Tcp(if cli.bootstrap_service { 8500u16 } else { 0 })

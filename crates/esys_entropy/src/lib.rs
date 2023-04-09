@@ -7,15 +7,15 @@ use esys_wirehair::WirehairDecoder;
 use libp2p::{
     core::{muxing::StreamMuxerBox, transport, ConnectedPoint},
     futures::StreamExt,
-    identify::{self, Info},
-    identity::Keypair,
+    identify,
+    identity::{Keypair, PublicKey},
     kad::{
         kbucket, record::Key, store::MemoryStore, GetRecordError, GetRecordOk, Kademlia,
         KademliaEvent, PutRecordError, QueryResult, Quorum, Record,
     },
     multiaddr,
     multihash::{Code, Hasher, Multihash, MultihashDigest, Sha2_256},
-    request_response::ProtocolSupport,
+    request_response::{ProtocolSupport, RequestId},
     swarm::{
         AddressScore, NetworkBehaviour as NetworkBehavior, SwarmBuilder,
         SwarmEvent::{self, Behaviour as Behavior},
@@ -37,10 +37,22 @@ pub struct App {
     entropy: behavior::Behavior,
 }
 
+impl App {
+    fn send_request_with_addr(
+        &mut self,
+        peer_id: &PeerId,
+        addr: Multiaddr,
+        request: proto::Request,
+    ) -> RequestId {
+        self.entropy.remove_address(peer_id, &addr);
+        self.entropy.add_address(peer_id, addr);
+        self.entropy.send_request(peer_id, request)
+    }
+}
+
 #[derive(Clone)]
 pub struct AppHandle {
     ingress: mpsc::UnboundedSender<IngressTask>,
-    // state: ControlState,
 }
 
 type IngressTask = Box<dyn FnOnce(&mut Swarm<App>, &mut Vec<AppObserver>) + Send>;
@@ -68,10 +80,7 @@ impl App {
         };
         let mut swarm = SwarmBuilder::with_tokio_executor(transport, app, id).build();
         let mut ingress = mpsc::unbounded_channel();
-        let control = AppHandle {
-            ingress: ingress.0,
-            // state: ControlState::new(id, keypair),
-        };
+        let control = AppHandle { ingress: ingress.0 };
         let name = name.to_string();
         let handle = spawn(async move {
             tracing::trace!("launch app event looop");
@@ -146,7 +155,7 @@ impl AppHandle {
         });
     }
 
-    pub fn serve_listen(
+    pub fn serve_add_external_address(
         &self,
         mut into_external: impl FnMut(&Multiaddr) -> Option<Multiaddr> + Send + 'static,
     ) {
@@ -162,7 +171,7 @@ impl AppHandle {
         drop(s);
     }
 
-    pub fn serve_kad(&self) {
+    pub fn serve_kad_add_address(&self) {
         let s = self.subscribe(|event, swarm| {
             if let SwarmEvent::Behaviour(AppEvent::Identify(identify::Event::Received {
                 peer_id,
@@ -374,21 +383,15 @@ pub struct AppControl {
     pub handle: AppHandle,
     id: PeerId,
     keypair: Keypair,
+    addr: Multiaddr,
     chunks: HashMap<Multihash, Chunk>,
-    peers: HashMap<PeerId, PeerInfo>,
-}
-
-enum PeerInfo {
-    Queried(Multiaddr),
-    Identifying(Multiaddr, oneshot::Sender<()>),
-    Identified(Info),
 }
 
 #[derive(Debug)]
 struct Chunk {
     fragment_index: u32,
     fragment: Fragment,
-    members: HashMap<PeerId, u32>,
+    members: HashMap<PeerId, (u32, Multiaddr)>,
     proofs: HashMap<u32, (PeerId, Vec<u8>)>,
 }
 
@@ -399,35 +402,14 @@ enum Fragment {
 }
 
 impl AppControl {
-    pub fn new(handle: AppHandle, id: PeerId, keypair: Keypair) -> Self {
+    pub fn new(handle: AppHandle, id: PeerId, keypair: Keypair, addr: Multiaddr) -> Self {
         Self {
             handle,
             chunks: Default::default(),
-            peers: Default::default(),
             id,
+            addr,
             keypair,
         }
-    }
-
-    async fn query_address(&mut self, peer_id: PeerId) -> Option<Multiaddr> {
-        match self.peers.get(&peer_id) {
-            Some(PeerInfo::Queried(addr)) | Some(PeerInfo::Identifying(addr, _)) => {
-                return Some(addr.clone())
-            }
-            Some(PeerInfo::Identified(info)) => {
-                return info
-                    .listen_addrs
-                    .iter()
-                    .find(|addr| is_global(addr))
-                    .cloned()
-            }
-            _ => {}
-        }
-        let addr = self.handle.query_address(peer_id).await;
-        if let Some(addr) = &addr {
-            self.peers.insert(peer_id, PeerInfo::Queried(addr.clone()));
-        }
-        addr
     }
 
     // entropy message flow
@@ -451,16 +433,17 @@ impl AppControl {
     // (above low watermark)
 
     pub fn gossip(&self, chunk_hash: Multihash) {
-        let members = &self.chunks[&chunk_hash].members;
+        let chunk = &self.chunks[&chunk_hash];
         let request = proto::Request {
             inner: Some(proto::request::Inner::Gossip(proto::Gossip {
                 chunk_hash: chunk_hash.to_bytes(),
-                members: members.keys().map(PeerId::to_bytes).collect(),
+                members: chunk.to_members(),
             })),
         };
-        for &peer in members.keys() {
+        for &peer in chunk.members.keys() {
             let request = request.clone();
             self.handle.ingress(move |swarm| {
+                // invariant: every peer in `members` must have `add_address` upon inserting
                 swarm.behaviour_mut().entropy.send_request(&peer, request);
             });
         }
@@ -485,28 +468,18 @@ impl AppControl {
                 inner: Some(proto::request::Inner::Invite(proto::Invite {
                     chunk_hash: chunk_hash.to_bytes(),
                     fragment_index: index,
-                    members: chunk.members.keys().map(PeerId::to_bytes).collect(),
+                    members: chunk.to_members(),
                 })),
             };
             self.handle.ingress(move |swarm| {
-                // silly way to prevent duplicated address get recorded and becomes potential overhead
                 swarm
                     .behaviour_mut()
-                    .entropy
-                    .remove_address(&peer_id, &peer_addr);
-                swarm
-                    .behaviour_mut()
-                    .entropy
-                    .add_address(&peer_id, peer_addr);
-                swarm
-                    .behaviour_mut()
-                    .entropy
-                    .send_request(&peer_id, request);
+                    .send_request_with_addr(&peer_id, peer_addr, request);
             });
         }
     }
 
-    pub async fn handle_invite(&self, message: proto::Invite) {
+    pub async fn handle_invite(&mut self, message: proto::Invite) {
         let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
         if self.chunks.contains_key(&chunk_hash) {
             return; //
@@ -515,17 +488,38 @@ impl AppControl {
             //
             return;
         };
+
         let mut chunk = Chunk {
             fragment_index: message.fragment_index,
             fragment: Fragment::Incomplete(Mutex::new(WirehairDecoder::new(0, 0))), //
             members: Default::default(),
             proofs: Default::default(),
         };
-        chunk.members.insert(self.id, message.fragment_index);
+        chunk
+            .members
+            .insert(self.id, (message.fragment_index, self.addr.clone()));
         chunk
             .proofs
-            .insert(message.fragment_index, (self.id, proof));
-        // TODO
+            .insert(message.fragment_index, (self.id, proof.clone()));
+        self.chunks.insert(chunk_hash, chunk);
+
+        let request = proto::Request {
+            inner: Some(proto::request::Inner::QueryFragment(proto::QueryFragment {
+                chunk_hash: message.chunk_hash.clone(),
+                fragment_index: message.fragment_index,
+                public_key: self.keypair.public().to_protobuf_encoding(),
+                proof,
+            })),
+        };
+        self.handle.ingress(move |swarm| {
+            for member in message.members {
+                swarm.behaviour_mut().send_request_with_addr(
+                    &PeerId::from_bytes(&member.id).unwrap(),
+                    Multiaddr::try_from(member.addr).unwrap(),
+                    request.clone(),
+                );
+            }
+        });
     }
 
     pub fn handle_query_fragment(
@@ -539,7 +533,13 @@ impl AppControl {
             return None;
         };
 
-        if !self.verify(chunk_hash, message.fragment_index, peer_id, &message.proof) {
+        if !self.verify(
+            chunk_hash,
+            message.fragment_index,
+            peer_id,
+            &PublicKey::from_protobuf_encoding(&message.public_key).unwrap(),
+            &message.proof,
+        ) {
             //
             return None;
         }
@@ -595,12 +595,31 @@ impl AppControl {
         }
     }
 
-    fn verify(&self, chunk_hash: Multihash, index: u32, peer_id: PeerId, proof: &[u8]) -> bool {
+    fn verify(
+        &self,
+        chunk_hash: Multihash,
+        index: u32,
+        peer_id: PeerId,
+        public_key: &PublicKey,
+        proof: &[u8],
+    ) -> bool {
         let mut input = chunk_hash.to_bytes();
         input.extend(&index.to_be_bytes());
-        let Some(PeerInfo::Identified(info)) = self.peers.get(&peer_id) else {
-            unimplemented!()
-        };
-        info.public_key.verify(&input, proof) && Self::accepted(chunk_hash, index, peer_id, proof)
+        peer_id.is_public_key(public_key).unwrap()
+            && public_key.verify(&input, proof)
+            && Self::accepted(chunk_hash, index, peer_id, proof)
+    }
+}
+
+impl Chunk {
+    fn to_members(&self) -> Vec<proto::Member> {
+        self.members
+            .iter()
+            .map(|(id, (index, addr))| proto::Member {
+                index: *index,
+                id: id.to_bytes(),
+                addr: addr.to_vec(),
+            })
+            .collect()
     }
 }

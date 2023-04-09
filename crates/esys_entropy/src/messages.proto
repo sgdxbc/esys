@@ -23,13 +23,14 @@ message Response {
 message Invite {
     bytes chunk_hash = 1;
     uint32 fragment_index = 2;
-    repeated bytes members = 3;
+    repeated Member members = 3;
 }
 
 message QueryFragment {
     bytes chunk_hash = 1;
     uint32 fragment_index = 2; // of sender
-    bytes proof = 3;
+    bytes public_key = 3;
+    bytes proof = 4;
 }
 
 message QueryFragmentOk {
@@ -45,10 +46,17 @@ message QueryProof {
 message QueryProofOk {
     bytes chunk_hash = 1;
     uint32 fragment_index = 2; // of sender
-    bytes proof = 3;
+    bytes public_key = 3;
+    bytes proof = 4;
 }
 
 message Gossip {
     bytes chunk_hash = 1;
-    repeated bytes members = 2; // list of PeerId
+    repeated Member members = 2;
+}
+
+message Member {
+    uint32 index = 1;
+    bytes id = 2;
+    bytes addr = 3;
 }

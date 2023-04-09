@@ -26,8 +26,8 @@ async fn main() {
         .multiplex(YamuxConfig::default())
         .boxed();
     let (_handle, server_control) = App::run("bootstrap", transport, server_keypair);
-    server_control.serve_listen(|addr| Some(addr.clone()));
-    server_control.serve_kad();
+    server_control.serve_add_external_address(|addr| Some(addr.clone()));
+    server_control.serve_kad_add_address();
     server_control.listen_on("/memory/1".parse().unwrap());
 
     let n = 20;
@@ -48,8 +48,8 @@ async fn main() {
                     .multiplex(YamuxConfig::default())
                     .boxed();
                 let (_handle, control) = App::run(format!("client-{i}"), transport, key_pair);
-                control.serve_listen(|addr| Some(addr.clone()));
-                control.serve_kad();
+                control.serve_add_external_address(|addr| Some(addr.clone()));
+                control.serve_kad_add_address();
                 control.listen_on("/memory/0".parse().unwrap());
 
                 sleep(Duration::from_millis(i as u64 * 100)).await;
