@@ -1,6 +1,12 @@
 mod behavior;
 
-use std::{collections::HashMap, future::Future, mem::replace, ops::ControlFlow};
+use std::{
+    collections::HashMap,
+    future::Future,
+    mem::replace,
+    ops::ControlFlow,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use behavior::proto;
 use esys_wirehair::WirehairDecoder;
@@ -373,6 +379,20 @@ pub struct AppControl {
     keypair: Keypair,
     addr: Multiaddr,
     chunks: HashMap<Multihash, Chunk>,
+
+    config: AppConfig,
+}
+
+pub struct AppConfig {
+    pub invite_count: usize,
+    // minimum number of members for a group to be considered as "valid" (when receiving from Invite)
+    // >= (probably >) coding's k
+    pub fragment_k: usize,
+    pub fragment_n: usize,
+    pub watermark_interval: Duration,
+    pub membership_interval: Duration,
+    pub gossip_interval: Duration,
+    pub invite_interval: Duration,
 }
 
 #[derive(Debug)]
@@ -381,6 +401,10 @@ struct Chunk {
     fragment: Fragment,
     members: HashMap<PublicKey, Member>,
     indexes: HashMap<u32, PublicKey>,
+
+    enter_time_sec: u64,
+    // expiration duration
+    high_watermark: u32,
 }
 
 #[derive(Debug)]
@@ -397,12 +421,13 @@ enum Fragment {
 }
 
 impl AppControl {
-    pub fn new(handle: AppHandle, keypair: Keypair, addr: Multiaddr) -> Self {
+    pub fn new(handle: AppHandle, keypair: Keypair, addr: Multiaddr, config: AppConfig) -> Self {
         Self {
             handle,
             chunks: Default::default(),
             addr,
             keypair,
+            config,
         }
     }
 
@@ -430,7 +455,11 @@ impl AppControl {
         let chunk = &self.chunks[&chunk_hash];
         let request = proto::Request::from(proto::Gossip {
             chunk_hash: chunk_hash.to_bytes(),
-            members: chunk.gossip_members(),
+            members: chunk
+                .members
+                .iter()
+                .map(|(key, member)| proto::Member::new_gossip(member.index, key, &member.addr))
+                .collect(),
         });
         for (peer_key, member) in &chunk.members {
             if peer_key == &self.keypair.public() {
@@ -467,13 +496,23 @@ impl AppControl {
             // if chunk.members.contains_key(&peer_id) {
             //     continue;
             // }
+            // skip this check may cause some member to be re-invited (with low probability hopefully)
+            // which will be ignored by honest members, and a faulty member may try duplicated join anyway regardless
+            // of this inviting (and will be rejected), so it's fine
             let Some(peer_addr) = peer_addr else {
                 continue;
             };
             let request = proto::Request::from(proto::Invite {
                 chunk_hash: chunk_hash.to_bytes(),
                 fragment_index: index,
-                members: chunk.invite_members(),
+                enter_time_sec: chunk.enter_time_sec,
+                members: chunk
+                    .members
+                    .iter()
+                    .map(|(key, member)| {
+                        proto::Member::new(member.index, key, &member.addr, member.proof.clone())
+                    })
+                    .collect(),
             });
             self.handle.ingress(move |swarm| {
                 swarm
@@ -502,6 +541,8 @@ impl AppControl {
             fragment: Fragment::Incomplete(Mutex::new(WirehairDecoder::new(0, 0))), //
             members: Default::default(),
             indexes: Default::default(),
+            enter_time_sec: message.enter_time_sec,
+            high_watermark: message.fragment_index,
         };
         for member in &message.members {
             let public_key = PublicKey::from_protobuf_encoding(&member.public_key).unwrap();
@@ -519,9 +560,9 @@ impl AppControl {
                 },
             );
             chunk.indexes.insert(member.index, public_key);
+            chunk.high_watermark = u32::max(chunk.high_watermark, member.index);
         }
-        // TODO less than k
-        if chunk.indexes.len() < 10 {
+        if chunk.indexes.len() < self.config.fragment_k {
             //
             return;
         }
@@ -745,10 +786,11 @@ impl AppControl {
         public_key: &PublicKey,
         proof: &[u8],
     ) -> bool {
-        // TODO check high/low watermark?
         let mut input = chunk_hash.to_bytes();
         input.extend(&index.to_be_bytes());
-        public_key.verify(&input, proof)
+        let chunk = &self.chunks[&chunk_hash];
+        (chunk.low_watermark(&self.config)..=chunk.high_watermark).contains(&index)
+            && public_key.verify(&input, proof)
             && Self::accepted(
                 chunk_hash,
                 index,
@@ -759,21 +801,10 @@ impl AppControl {
 }
 
 impl Chunk {
-    fn gossip_members(&self) -> Vec<proto::Member> {
-        self.members
-            .iter()
-            .map(|(key, member)| proto::Member::new_gossip(member.index, key, &member.addr))
-            .collect()
-    }
-
-    // duplicated code
-    // i don't fucking care
-    fn invite_members(&self) -> Vec<proto::Member> {
-        self.members
-            .iter()
-            .map(|(key, member)| {
-                proto::Member::new(member.index, key, &member.addr, member.proof.clone())
-            })
-            .collect()
+    fn low_watermark(&self, config: &AppConfig) -> u32 {
+        ((SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
+            - Duration::from_secs(self.enter_time_sec))
+        .as_secs()
+            / config.watermark_interval.as_secs()) as _
     }
 }

@@ -22,8 +22,10 @@ message Response {
 
 message Invite {
     bytes chunk_hash = 1;
-    uint32 fragment_index = 2;
-    repeated Member members = 3;
+    uint32 fragment_index = 2; // of receiver
+    // TODO critical metadata should be securely protected by e.g. client signature
+    uint64 enter_time_sec = 3;
+    repeated Member members = 4;
 }
 
 message QueryFragment {
@@ -53,7 +55,7 @@ message Gossip {
 
 message Member {
     uint32 index = 1;
-    // omitted except in Gossip, derive from public key if needed
+    // TODO could be omitted except in Gossip, derive from public key if needed
     bytes id = 2;
     bytes addr = 3;
     // omitted in Gossip
