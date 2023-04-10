@@ -11,7 +11,88 @@ use libp2p::{
 use prost::Message;
 
 pub mod proto {
+    use libp2p::{identity::PublicKey, multihash::Multihash, Multiaddr, PeerId};
+
     include!(concat!(env!("OUT_DIR"), "/behavior.proto.rs"));
+
+    impl Member {
+        pub fn id(&self) -> PeerId {
+            PeerId::from_bytes(&self.id).unwrap()
+        }
+
+        pub fn addr(&self) -> Multiaddr {
+            Multiaddr::try_from(self.addr.clone()).unwrap()
+        }
+
+        pub fn public_key(&self) -> Option<PublicKey> {
+            if self.public_key.is_empty() {
+                None
+            } else {
+                Some(PublicKey::from_protobuf_encoding(&self.public_key).unwrap())
+            }
+        }
+
+        pub fn proof(&self) -> Option<&[u8]> {
+            if self.proof.is_empty() {
+                None
+            } else {
+                Some(&self.proof)
+            }
+        }
+
+        pub fn new(index: u32, public_key: &PublicKey, addr: &Multiaddr, proof: Vec<u8>) -> Self {
+            Self {
+                index,
+                id: PeerId::from_public_key(public_key).to_bytes(),
+                addr: addr.to_vec(),
+                public_key: public_key.to_protobuf_encoding(),
+                proof,
+            }
+        }
+
+        pub fn new_gossip(index: u32, public_key: &PublicKey, addr: &Multiaddr) -> Self {
+            Self {
+                index,
+                id: PeerId::from_public_key(public_key).to_bytes(),
+                addr: addr.to_vec(),
+                ..Default::default()
+            }
+        }
+    }
+
+    macro_rules! impl_chunk_hash {
+        ($t:ty) => {
+            impl $t {
+                pub fn chunk_hash(&self) -> Multihash {
+                    Multihash::from_bytes(&self.chunk_hash).unwrap()
+                }
+            }
+        };
+    }
+    impl_chunk_hash!(Gossip);
+    impl_chunk_hash!(Invite);
+    impl_chunk_hash!(QueryFragment);
+    impl_chunk_hash!(QueryFragmentOk);
+    impl_chunk_hash!(QueryProof);
+    impl_chunk_hash!(QueryProofOk);
+
+    macro_rules! impl_from {
+        ($source_type:ident, $dest_type:ty, $wrap_type:ty) => {
+            impl From<$source_type> for $dest_type {
+                fn from(value: $source_type) -> Self {
+                    Self {
+                        inner: Some(<$wrap_type>::$source_type(value)),
+                    }
+                }
+            }
+        };
+    }
+    impl_from!(Gossip, Request, request::Inner);
+    impl_from!(Invite, Request, request::Inner);
+    impl_from!(QueryFragment, Request, request::Inner);
+    impl_from!(QueryProof, Request, request::Inner);
+    impl_from!(QueryFragmentOk, Response, response::Inner);
+    impl_from!(QueryProofOk, Response, response::Inner);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]

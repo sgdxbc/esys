@@ -15,7 +15,7 @@ use libp2p::{
     },
     multiaddr,
     multihash::{Code, Hasher, Multihash, MultihashDigest, Sha2_256},
-    request_response::{ProtocolSupport, RequestId, ResponseChannel},
+    request_response::{ProtocolSupport, ResponseChannel},
     swarm::{
         AddressScore, NetworkBehaviour as NetworkBehavior, SwarmBuilder,
         SwarmEvent::{self, Behaviour as Behavior},
@@ -38,15 +38,10 @@ pub struct App {
 }
 
 impl App {
-    fn send_request_with_addr(
-        &mut self,
-        peer_id: &PeerId,
-        addr: Multiaddr,
-        request: proto::Request,
-    ) -> RequestId {
+    fn entropy_ensure_address(&mut self, peer_id: &PeerId, addr: Multiaddr) {
+        // silly way to prevent repeated address for a peer to cause problems
         self.entropy.remove_address(peer_id, &addr);
         self.entropy.add_address(peer_id, addr);
-        self.entropy.send_request(peer_id, request)
     }
 }
 
@@ -381,7 +376,6 @@ fn is_global(addr: &Multiaddr) -> bool {
 
 pub struct AppControl {
     pub handle: AppHandle,
-    id: PeerId,
     keypair: Keypair,
     addr: Multiaddr,
     chunks: HashMap<Multihash, Chunk>,
@@ -402,11 +396,10 @@ enum Fragment {
 }
 
 impl AppControl {
-    pub fn new(handle: AppHandle, id: PeerId, keypair: Keypair, addr: Multiaddr) -> Self {
+    pub fn new(handle: AppHandle, keypair: Keypair, addr: Multiaddr) -> Self {
         Self {
             handle,
             chunks: Default::default(),
-            id,
             addr,
             keypair,
         }
@@ -434,20 +427,21 @@ impl AppControl {
 
     pub fn gossip(&self, chunk_hash: Multihash) {
         let chunk = &self.chunks[&chunk_hash];
-        let request = proto::Request {
-            inner: Some(proto::request::Inner::Gossip(proto::Gossip {
-                chunk_hash: chunk_hash.to_bytes(),
-                members: chunk.gossip_members(),
-            })),
-        };
-        for peer_key in chunk.members.keys() {
-            let peer_id = PeerId::from_public_key(peer_key);
-            if peer_id == self.id {
+        let request = proto::Request::from(proto::Gossip {
+            chunk_hash: chunk_hash.to_bytes(),
+            members: chunk.gossip_members(),
+        });
+        for (peer_key, (_, peer_addr)) in &chunk.members {
+            if peer_key == &self.keypair.public() {
                 continue;
             }
+            let peer_id = PeerId::from_public_key(peer_key);
+            let peer_addr = peer_addr.clone();
             let request = request.clone();
             self.handle.ingress(move |swarm| {
-                // invariant: every peer in `members` must have `add_address` upon inserting
+                swarm
+                    .behaviour_mut()
+                    .entropy_ensure_address(&peer_id, peer_addr);
                 swarm
                     .behaviour_mut()
                     .entropy
@@ -475,23 +469,25 @@ impl AppControl {
             let Some(peer_addr) = peer_addr else {
                 continue;
             };
-            let request = proto::Request {
-                inner: Some(proto::request::Inner::Invite(proto::Invite {
-                    chunk_hash: chunk_hash.to_bytes(),
-                    fragment_index: index,
-                    members: chunk.invite_members(),
-                })),
-            };
+            let request = proto::Request::from(proto::Invite {
+                chunk_hash: chunk_hash.to_bytes(),
+                fragment_index: index,
+                members: chunk.invite_members(),
+            });
             self.handle.ingress(move |swarm| {
                 swarm
                     .behaviour_mut()
-                    .send_request_with_addr(&peer_id, peer_addr, request);
+                    .entropy_ensure_address(&peer_id, peer_addr);
+                swarm
+                    .behaviour_mut()
+                    .entropy
+                    .send_request(&peer_id, request);
             });
         }
     }
 
     pub async fn handle_invite(&mut self, message: &proto::Invite) {
-        let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
+        let chunk_hash = message.chunk_hash();
         if self.chunks.contains_key(&chunk_hash) {
             return; //
         }
@@ -507,15 +503,8 @@ impl AppControl {
             proofs: Default::default(),
         };
         for member in &message.members {
-            let peer_id = PeerId::from_bytes(&member.id).unwrap();
             let public_key = PublicKey::from_protobuf_encoding(&member.public_key).unwrap();
-            if !self.verify(
-                chunk_hash,
-                member.index,
-                peer_id,
-                &public_key,
-                &member.proof,
-            ) {
+            if !self.verify(chunk_hash, member.index, &public_key, &member.proof) {
                 //
                 continue;
             }
@@ -545,26 +534,25 @@ impl AppControl {
             (self.keypair.public(), proof.clone()),
         );
 
-        let request = proto::Request {
-            inner: Some(proto::request::Inner::QueryFragment(proto::QueryFragment {
-                chunk_hash: message.chunk_hash.clone(),
-                member: Some(proto::Member {
-                    id: self.id.to_bytes(),
-                    addr: self.addr.to_vec(),
-                    index: message.fragment_index,
-                    public_key: self.keypair.public().to_protobuf_encoding(),
-                    proof,
-                }),
-            })),
-        };
+        let request = proto::Request::from(proto::QueryFragment {
+            chunk_hash: message.chunk_hash.clone(),
+            member: Some(proto::Member::new(
+                message.fragment_index,
+                &self.keypair.public(),
+                &self.addr,
+                proof,
+            )),
+        });
         for (peer_key, (_, addr)) in &chunk.members {
             let peer_id = PeerId::from_public_key(peer_key);
             let addr = addr.clone();
             let request = request.clone();
             self.handle.ingress(move |swarm| {
+                swarm.behaviour_mut().entropy_ensure_address(&peer_id, addr);
                 swarm
                     .behaviour_mut()
-                    .send_request_with_addr(&peer_id, addr, request);
+                    .entropy
+                    .send_request(&peer_id, request);
             });
         }
 
@@ -576,7 +564,7 @@ impl AppControl {
         message: &proto::QueryFragment,
         channel: ResponseChannel<proto::Response>,
     ) {
-        let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
+        let chunk_hash = message.chunk_hash();
         let Some(chunk) = self.chunks.get(&chunk_hash) else {
             //
             return;
@@ -586,26 +574,23 @@ impl AppControl {
         if !self.verify(
             chunk_hash,
             member.index,
-            PeerId::from_bytes(&member.id).unwrap(),
-            &PublicKey::from_protobuf_encoding(&member.public_key).unwrap(),
+            &member.public_key().unwrap(),
             &member.proof,
         ) {
             //
             return;
         }
 
+        // TODO keep new member's proof somewhere so it can immediately be accepted upon receiving gossip
+
         let Fragment::Complete(fragment) = &chunk.fragment else {
             panic!("receive query fragment before sending gossip")
         };
-        let response = proto::Response {
-            inner: Some(proto::response::Inner::QueryFragmentOk(
-                proto::QueryFragmentOk {
-                    chunk_hash: message.chunk_hash.clone(),
-                    fragment_index: chunk.fragment_index,
-                    fragment: fragment.clone(),
-                },
-            )),
-        };
+        let response = proto::Response::from(proto::QueryFragmentOk {
+            chunk_hash: message.chunk_hash.clone(),
+            fragment_index: chunk.fragment_index,
+            fragment: fragment.clone(),
+        });
         self.handle.ingress(move |swarm| {
             swarm
                 .behaviour_mut()
@@ -616,7 +601,7 @@ impl AppControl {
     }
 
     pub fn handle_query_fragment_ok(&mut self, message: &proto::QueryFragmentOk) {
-        let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
+        let chunk_hash = message.chunk_hash();
         let Some(chunk) = self.chunks.get_mut(&chunk_hash) else {
             //
             return;
@@ -635,7 +620,9 @@ impl AppControl {
         }
 
         // replace with a placeholder
-        let Fragment::Incomplete(decoder) = replace(&mut chunk.fragment, Fragment::Complete(Default::default())) else {
+        let Fragment::Incomplete(decoder) =
+            replace(&mut chunk.fragment, Fragment::Complete(Default::default()))
+        else {
             unreachable!()
         };
         let mut fragment = vec![0; 0]; //
@@ -655,23 +642,19 @@ impl AppControl {
         message: &proto::QueryProof,
         channel: ResponseChannel<proto::Response>,
     ) {
-        let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
-        let Some(chunk) = self.chunks.get(&chunk_hash) else {
+        let Some(chunk) = self.chunks.get(&message.chunk_hash()) else {
             //
             return;
         };
-        let response = proto::Response {
-            inner: Some(proto::response::Inner::QueryProofOk(proto::QueryProofOk {
-                chunk_hash: message.chunk_hash.clone(),
-                member: Some(proto::Member {
-                    index: chunk.fragment_index,
-                    public_key: self.keypair.public().to_protobuf_encoding(),
-                    proof: chunk.proofs[&chunk.fragment_index].1.clone(),
-                    addr: self.addr.to_vec(),
-                    id: self.id.to_bytes(),
-                }),
-            })),
-        };
+        let response = proto::Response::from(proto::QueryProofOk {
+            chunk_hash: message.chunk_hash.clone(),
+            member: Some(proto::Member::new(
+                chunk.fragment_index,
+                &self.keypair.public(),
+                &self.addr,
+                chunk.proofs[&chunk.fragment_index].1.clone(),
+            )),
+        });
         self.handle.ingress(move |swarm| {
             swarm
                 .behaviour_mut()
@@ -682,30 +665,25 @@ impl AppControl {
     }
 
     pub fn handle_query_proof_ok(&mut self, message: &proto::QueryProofOk) {
-        let chunk_hash = Multihash::from_bytes(&message.chunk_hash).unwrap();
+        let chunk_hash = message.chunk_hash();
         if !self.chunks.contains_key(&chunk_hash) {
             //
             return;
         }
         let member = message.member.as_ref().unwrap();
-        let public_key = PublicKey::from_protobuf_encoding(&member.public_key).unwrap();
-        let peer_id = PeerId::from_bytes(&member.id).unwrap();
-        if !self.verify(
-            chunk_hash,
-            member.index,
-            peer_id,
-            &public_key,
-            &member.proof,
-        ) {
+        let public_key = member.public_key().unwrap();
+        if !self.verify(chunk_hash, member.index, &public_key, &member.proof) {
             //
             return;
         }
-        // chunk.members.insert(peer_id, (message.fragment_index, message.add))
-        self.chunks
-            .get_mut(&chunk_hash)
-            .unwrap()
+        let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
+        chunk
+            .members
+            .insert(public_key.clone(), (member.index, member.addr()));
+        chunk
             .proofs
             .insert(member.index, (public_key, member.proof.clone()));
+        // TODO update high watermark
     }
 
     // TODO homomorphic hashing
@@ -741,7 +719,12 @@ impl AppControl {
             input.extend(&index.to_be_bytes());
             self.keypair.sign(&input).unwrap()
         };
-        if Self::accepted(chunk_hash, index, self.id, &proof) {
+        if Self::accepted(
+            chunk_hash,
+            index,
+            PeerId::from_public_key(&self.keypair.public()),
+            &proof,
+        ) {
             Some(proof)
         } else {
             None
@@ -752,16 +735,19 @@ impl AppControl {
         &self,
         chunk_hash: Multihash,
         index: u32,
-        peer_id: PeerId,
         public_key: &PublicKey,
         proof: &[u8],
     ) -> bool {
         // TODO check high/low watermark?
         let mut input = chunk_hash.to_bytes();
         input.extend(&index.to_be_bytes());
-        peer_id.is_public_key(public_key).unwrap()
-            && public_key.verify(&input, proof)
-            && Self::accepted(chunk_hash, index, peer_id, proof)
+        public_key.verify(&input, proof)
+            && Self::accepted(
+                chunk_hash,
+                index,
+                PeerId::from_public_key(public_key),
+                proof,
+            )
     }
 }
 
