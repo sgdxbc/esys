@@ -384,10 +384,9 @@ pub struct AppControl {
 
 pub struct AppConfig {
     pub invite_count: usize,
-    // minimum number of members for a group to be considered as "valid" (when receiving from Invite)
-    // >= (probably >) coding's k
     pub fragment_k: usize,
     pub fragment_n: usize,
+    pub fragment_size: usize,
     pub watermark_interval: Duration,
     pub membership_interval: Duration,
     pub gossip_interval: Duration,
@@ -628,7 +627,10 @@ impl AppControl {
 
         let mut chunk = Chunk {
             fragment_index: message.fragment_index,
-            fragment: Fragment::Incomplete(Mutex::new(WirehairDecoder::new(0, 0))), //
+            fragment: Fragment::Incomplete(Mutex::new(WirehairDecoder::new(
+                (self.config.fragment_size * self.config.fragment_k) as _,
+                self.config.fragment_size as _,
+            ))),
             members: Default::default(),
             indexes: Default::default(),
             joining_members: Default::default(),
@@ -641,10 +643,6 @@ impl AppControl {
                 .max()
                 .unwrap(),
         };
-        if chunk.fragment_count() < self.config.fragment_k {
-            //
-            return;
-        }
 
         chunk.members.insert(
             PeerId::from_public_key(&self.keypair.public()),
@@ -774,7 +772,7 @@ impl AppControl {
         else {
             unreachable!()
         };
-        let mut fragment = vec![0; 0]; //
+        let mut fragment = vec![0; self.config.fragment_size];
         decoder
             .into_inner()
             .unwrap()

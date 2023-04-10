@@ -114,6 +114,7 @@ struct Stats {
     churn: u32,
     data_lost: u32,
     targeted: u32,
+    repair: f32,
 }
 
 impl System {
@@ -137,6 +138,7 @@ impl System {
         for _ in 0..system.config.object_count {
             system.add_object(&mut rng);
         }
+        system.stats.repair = 0.; // eliminate side effect of `add_fragment`
 
         let targeted_groups = (0..system.config.object_count)
             .flat_map(|object_id| {
@@ -282,9 +284,12 @@ impl System {
         if !faulty {
             chunk.alive_count += 1;
         }
+
         if chunk.targeted {
             self.targeted_nodes.insert(node_id);
         }
+
+        self.stats.repair += 1. / self.config.chunk_k as f32; // TODO simulate caching
     }
 
     fn remove_fragment(
@@ -329,20 +334,23 @@ impl System {
     fn on_churn(&mut self, mut rng: impl Rng) {
         self.stats.churn += 1;
 
-        // let (exit_id, exit_node) = self.nodes.iter().choose(&mut rng).unwrap();
-        let exit_id = self.nodes_cache.choose(&mut rng).unwrap();
-        let exit_node = &self.nodes[exit_id];
+        let (mut exit_id, mut exit_node);
         // faulty node never leave
         // because faulty node never store anything, so does not "discard nothing" here should not make the attack even
         // weaker
         // if faulty node always live, it can stay in the committee until get kicked out, and this should make the
         // attack stronger
-        if !exit_node.faulty {
-            self.remove_node(*exit_id, &mut rng);
-            // the new node is added after all involved committee find their new members
-            // seems reasonable and not increasing durability
-            self.add_node(false); // prevent increase number of faulty
-        }
+        while {
+            // let (exit_id, exit_node) = self.nodes.iter().choose(&mut rng).unwrap();
+            exit_id = self.nodes_cache.choose(&mut rng).unwrap();
+            exit_node = &self.nodes[exit_id];
+            exit_node.faulty
+        } {}
+
+        self.remove_node(*exit_id, &mut rng);
+        // the new node is added after all involved committee find their new members
+        // seems reasonable and not increasing durability
+        self.add_node(false); // prevent increase number of faulty
 
         self.add_churn_event(&mut rng);
     }
@@ -398,9 +406,9 @@ impl Config {
 
 fn main() {
     let config = Config {
-        churn_rate: 36.5,
+        churn_rate: 0.1,
         node_count: 10000,
-        duration: 1,
+        duration: 10,
         faulty_rate: 0.33,
         object_count: 100,
         chunk_n: 100,
