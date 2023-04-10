@@ -35,7 +35,7 @@ message QueryFragment {
 
 message QueryFragmentOk {
     bytes chunk_hash = 1;
-    uint32 fragment_index = 2; // of sender
+    Member member = 2; // of sender
     bytes fragment = 3;
 }
 
@@ -56,10 +56,11 @@ message Gossip {
 
 message Member {
     uint32 index = 1;
-    // TODO could be omitted except in Gossip, derive from public key if needed
+    // TODO could be omitted except in Gossip/Invite, derive from public key if needed
     bytes id = 2;
     bytes addr = 3;
-    // omitted in Gossip
+
+    // omitted in Gossip and Invite
     bytes public_key = 4;
     bytes proof = 5;
 }

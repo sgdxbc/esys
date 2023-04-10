@@ -42,7 +42,7 @@ pub mod proto {
             }
         }
 
-        pub fn new_gossip(index: u32, public_key: &PublicKey, addr: &Multiaddr) -> Self {
+        pub fn new_trustless(index: u32, public_key: &PublicKey, addr: &Multiaddr) -> Self {
             Self {
                 index,
                 id: PeerId::from_public_key(public_key).to_bytes(),
