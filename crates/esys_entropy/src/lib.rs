@@ -279,14 +279,10 @@ impl AppHandle {
         .await
     }
 
-    pub async fn query_address(&self, peer_id: PeerId) -> Option<Multiaddr> {
+    pub async fn query_address(&self, peer_id: &PeerId) -> Option<Multiaddr> {
+        let key = Key::new(&peer_id.to_bytes());
         let get_id = self
-            .ingress_wait(move |swarm| {
-                swarm
-                    .behaviour_mut()
-                    .kad
-                    .get_record(Key::new(&peer_id.to_bytes()))
-            })
+            .ingress_wait(move |swarm| swarm.behaviour_mut().kad.get_record(key))
             .await;
         // tracing::debug!(%peer_id, ?get_id);
         self.subscribe(move |event, swarm| match event {
@@ -351,10 +347,8 @@ impl AppHandle {
                 .into_iter()
                 .map(|peer_id| {
                     let control = self.clone();
-                    (
-                        peer_id,
-                        spawn(async move { control.query_address(peer_id).await }),
-                    )
+                    let task = spawn(async move { control.query_address(&peer_id).await });
+                    (peer_id, task)
                 })
                 .take(n),
         );
@@ -693,9 +687,9 @@ impl AppControl {
         Code::Sha2_256.digest(&input)
     }
 
-    fn accept_probablity(chunk_hash: Multihash, index: u32, peer_id: PeerId) -> f64 {
+    fn accept_probablity(chunk_hash: Multihash, index: u32, peer_id: &PeerId) -> f64 {
         let fragment_hash = Self::fragment_hash(chunk_hash, index);
-        let distance = kbucket::Key::from(fragment_hash).distance(&kbucket::Key::from(peer_id));
+        let distance = kbucket::Key::from(fragment_hash).distance(&kbucket::Key::from(*peer_id));
         // TODO tune the probability distribution properly
         match distance.ilog2() {
             None => 0.95,
@@ -704,7 +698,7 @@ impl AppControl {
         }
     }
 
-    fn accepted(chunk_hash: Multihash, index: u32, peer_id: PeerId, proof: &[u8]) -> bool {
+    fn accepted(chunk_hash: Multihash, index: u32, peer_id: &PeerId, proof: &[u8]) -> bool {
         let seed = {
             let mut hasher = Sha2_256::default();
             hasher.update(proof);
@@ -722,7 +716,7 @@ impl AppControl {
         if Self::accepted(
             chunk_hash,
             index,
-            PeerId::from_public_key(&self.keypair.public()),
+            &PeerId::from_public_key(&self.keypair.public()),
             &proof,
         ) {
             Some(proof)
@@ -745,7 +739,7 @@ impl AppControl {
             && Self::accepted(
                 chunk_hash,
                 index,
-                PeerId::from_public_key(public_key),
+                &PeerId::from_public_key(public_key),
                 proof,
             )
     }
@@ -755,12 +749,7 @@ impl Chunk {
     fn gossip_members(&self) -> Vec<proto::Member> {
         self.members
             .iter()
-            .map(|(key, (index, addr))| proto::Member {
-                index: *index,
-                id: PeerId::from_public_key(key).to_bytes(),
-                addr: addr.to_vec(),
-                ..Default::default()
-            })
+            .map(|(key, (index, addr))| proto::Member::new_gossip(*index, key, addr))
             .collect()
     }
 
@@ -769,12 +758,8 @@ impl Chunk {
     fn invite_members(&self) -> Vec<proto::Member> {
         self.members
             .iter()
-            .map(|(key, (index, addr))| proto::Member {
-                index: *index,
-                id: PeerId::from_public_key(key).to_bytes(),
-                addr: addr.to_vec(),
-                public_key: key.to_protobuf_encoding(),
-                proof: self.proofs[index].1.clone(),
+            .map(|(key, (index, addr))| {
+                proto::Member::new(*index, key, addr, self.proofs[index].1.clone())
             })
             .collect()
     }
