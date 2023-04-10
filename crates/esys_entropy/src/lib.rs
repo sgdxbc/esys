@@ -3,8 +3,8 @@ mod behavior;
 use std::{
     collections::HashMap,
     future::Future,
-    mem::replace,
-    ops::ControlFlow,
+    mem::{replace, take},
+    ops::{ControlFlow, RangeInclusive},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -399,8 +399,11 @@ pub struct AppConfig {
 struct Chunk {
     fragment_index: u32,
     fragment: Fragment,
-    members: HashMap<PublicKey, Member>,
+    members: HashMap<PeerId, Member>,
     indexes: HashMap<u32, PublicKey>,
+    // verified but not yet gossip, so not sure whether it has a fragment available already
+    // not send to invited nodes to prevent fetch fragment from a premature member
+    joining_members: HashMap<PublicKey, Member>,
 
     enter_time_sec: u64,
     // expiration duration
@@ -412,6 +415,7 @@ struct Member {
     index: u32,
     addr: Multiaddr,
     proof: Vec<u8>,
+    alive: bool,
 }
 
 #[derive(Debug)]
@@ -455,17 +459,24 @@ impl AppControl {
         let chunk = &self.chunks[&chunk_hash];
         let request = proto::Request::from(proto::Gossip {
             chunk_hash: chunk_hash.to_bytes(),
+            fragment_index: chunk.fragment_index,
             members: chunk
                 .members
-                .iter()
-                .map(|(key, member)| proto::Member::new_gossip(member.index, key, &member.addr))
+                .values()
+                .map(|member| {
+                    proto::Member::new_gossip(
+                        member.index,
+                        &chunk.indexes[&member.index],
+                        &member.addr,
+                    )
+                })
                 .collect(),
         });
-        for (peer_key, member) in &chunk.members {
-            if peer_key == &self.keypair.public() {
+        for (peer_id, member) in &chunk.members {
+            if peer_id == &PeerId::from_public_key(&self.keypair.public()) {
                 continue;
             }
-            let peer_id = PeerId::from_public_key(peer_key);
+            let peer_id = *peer_id;
             let peer_addr = member.addr.clone();
             let request = request.clone();
             self.handle.ingress(move |swarm| {
@@ -480,8 +491,34 @@ impl AppControl {
         }
     }
 
-    pub fn handle_gossip(&self, message: &proto::Gossip) {
-        //
+    pub fn handle_gossip(&mut self, message: &proto::Gossip) {
+        let Some(chunk) = self.chunks.get_mut(&message.chunk_hash()) else {
+            //
+            return;
+        };
+        for member in &message.members {
+            if !chunk.watermark(&self.config).contains(&member.index) {
+                continue;
+            }
+            if let Some(local_member) = chunk.members.get_mut(&member.id()) {
+                if local_member.index == message.fragment_index {
+                    local_member.alive = true;
+                }
+            } else {
+                let peer_id = member.id();
+                let addr = member.addr();
+                let request = proto::Request::from(proto::QueryProof {
+                    chunk_hash: message.chunk_hash.clone(),
+                });
+                self.handle.ingress(move |swarm| {
+                    swarm.behaviour_mut().entropy_ensure_address(&peer_id, addr);
+                    swarm
+                        .behaviour_mut()
+                        .entropy
+                        .send_request(&peer_id, request);
+                });
+            }
+        }
     }
 
     pub async fn invite(&self, chunk_hash: Multihash, index: u32) {
@@ -508,9 +545,14 @@ impl AppControl {
                 enter_time_sec: chunk.enter_time_sec,
                 members: chunk
                     .members
-                    .iter()
-                    .map(|(key, member)| {
-                        proto::Member::new(member.index, key, &member.addr, member.proof.clone())
+                    .values()
+                    .map(|member| {
+                        proto::Member::new(
+                            member.index,
+                            &chunk.indexes[&member.index],
+                            &member.addr,
+                            member.proof.clone(),
+                        )
                     })
                     .collect(),
             });
@@ -541,28 +583,25 @@ impl AppControl {
             fragment: Fragment::Incomplete(Mutex::new(WirehairDecoder::new(0, 0))), //
             members: Default::default(),
             indexes: Default::default(),
+            joining_members: Default::default(),
             enter_time_sec: message.enter_time_sec,
             high_watermark: message.fragment_index,
         };
         for member in &message.members {
-            let public_key = PublicKey::from_protobuf_encoding(&member.public_key).unwrap();
+            let public_key = member.public_key().unwrap();
             if !self.verify(chunk_hash, member.index, &public_key, &member.proof) {
                 //
                 continue;
             }
-            // TODO one peer multiple index / multiple peer one index
             chunk.members.insert(
-                public_key.clone(),
-                Member {
-                    index: member.index,
-                    addr: member.addr(),
-                    proof: member.proof.clone(),
-                },
+                PeerId::from_public_key(&public_key),
+                Member::new(member, false),
             );
             chunk.indexes.insert(member.index, public_key);
             chunk.high_watermark = u32::max(chunk.high_watermark, member.index);
         }
-        if chunk.indexes.len() < self.config.fragment_k {
+        chunk.retain_alive(&self.config);
+        if chunk.fragment_count() < self.config.fragment_k {
             //
             return;
         }
@@ -576,8 +615,8 @@ impl AppControl {
                 proof.clone(),
             )),
         });
-        for (peer_key, member) in &chunk.members {
-            let peer_id = PeerId::from_public_key(peer_key);
+        for (peer_id, member) in &chunk.members {
+            let peer_id = *peer_id;
             let addr = member.addr.clone();
             let request = request.clone();
             self.handle.ingress(move |swarm| {
@@ -590,11 +629,12 @@ impl AppControl {
         }
 
         chunk.members.insert(
-            self.keypair.public(),
+            PeerId::from_public_key(&self.keypair.public()),
             Member {
                 index: chunk.fragment_index,
                 addr: self.addr.clone(),
                 proof,
+                alive: true,
             },
         );
         chunk
@@ -604,28 +644,27 @@ impl AppControl {
     }
 
     pub fn handle_query_fragment(
-        &self,
+        &mut self,
         message: &proto::QueryFragment,
         channel: ResponseChannel<proto::Response>,
     ) {
         let chunk_hash = message.chunk_hash();
-        let Some(chunk) = self.chunks.get(&chunk_hash) else {
-            //
-            return;
-        };
-
-        let member = message.member.as_ref().unwrap();
-        if !self.verify(
-            chunk_hash,
-            member.index,
-            &member.public_key().unwrap(),
-            &member.proof,
-        ) {
+        if !self.chunks.contains_key(&chunk_hash) {
             //
             return;
         }
 
-        // TODO keep new member's proof somewhere so it can immediately be accepted upon receiving gossip
+        let member = message.member.as_ref().unwrap();
+        let public_key = member.public_key().unwrap();
+        if !self.verify(chunk_hash, member.index, &public_key, &member.proof) {
+            //
+            return;
+        }
+
+        let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
+        chunk
+            .joining_members
+            .insert(public_key, Member::new(member, false));
 
         let Fragment::Complete(fragment) = &chunk.fragment else {
             panic!("receive query fragment before sending gossip")
@@ -650,6 +689,7 @@ impl AppControl {
             //
             return;
         };
+        // TODO set alive?
         let Fragment::Incomplete(decoder) = &mut chunk.fragment else {
             //
             return;
@@ -697,7 +737,9 @@ impl AppControl {
                 chunk.fragment_index,
                 &local_key,
                 &self.addr,
-                chunk.members[&local_key].proof.clone(),
+                chunk.members[&PeerId::from_public_key(&local_key)]
+                    .proof
+                    .clone(),
             )),
         });
         self.handle.ingress(move |swarm| {
@@ -723,12 +765,8 @@ impl AppControl {
         }
         let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
         chunk.members.insert(
-            public_key.clone(),
-            Member {
-                index: member.index,
-                addr: member.addr(),
-                proof: member.proof.clone(),
-            },
+            PeerId::from_public_key(&public_key),
+            Member::new(member, true),
         );
         chunk.indexes.insert(member.index, public_key);
         // TODO update high watermark
@@ -789,7 +827,7 @@ impl AppControl {
         let mut input = chunk_hash.to_bytes();
         input.extend(&index.to_be_bytes());
         let chunk = &self.chunks[&chunk_hash];
-        (chunk.low_watermark(&self.config)..=chunk.high_watermark).contains(&index)
+        chunk.watermark(&self.config).contains(&index)
             && public_key.verify(&input, proof)
             && Self::accepted(
                 chunk_hash,
@@ -806,5 +844,42 @@ impl Chunk {
             - Duration::from_secs(self.enter_time_sec))
         .as_secs()
             / config.watermark_interval.as_secs()) as _
+    }
+
+    fn watermark(&self, config: &AppConfig) -> RangeInclusive<u32> {
+        self.low_watermark(config)..=self.high_watermark
+    }
+
+    fn fragment_count(&self) -> usize {
+        self.indexes.len()
+    }
+
+    fn retain_alive(&mut self, config: &AppConfig) {
+        let watermark = self.watermark(config);
+        let mut members = take(&mut self.members);
+        let indexes = take(&mut self.indexes);
+        for (index, public_key) in indexes {
+            let peer_id = PeerId::from_public_key(&public_key);
+            if !watermark.contains(&index) || members[&peer_id].index != index {
+                continue;
+            };
+            let member = members.remove(&peer_id).unwrap();
+            if !member.alive {
+                continue;
+            }
+            self.indexes.insert(index, public_key.clone());
+            self.members.insert(peer_id, member);
+        }
+    }
+}
+
+impl Member {
+    fn new(member: &proto::Member, alive: bool) -> Self {
+        Self {
+            index: member.index,
+            addr: member.addr(),
+            proof: member.proof.clone(),
+            alive,
+        }
     }
 }

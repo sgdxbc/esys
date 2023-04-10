@@ -50,7 +50,8 @@ message QueryProofOk {
 
 message Gossip {
     bytes chunk_hash = 1;
-    repeated Member members = 2;
+    uint32 fragment_index = 2; // of sender
+    repeated Member members = 3;
 }
 
 message Member {

@@ -32,14 +32,6 @@ pub mod proto {
             }
         }
 
-        pub fn proof(&self) -> Option<&[u8]> {
-            if self.proof.is_empty() {
-                None
-            } else {
-                Some(&self.proof)
-            }
-        }
-
         pub fn new(index: u32, public_key: &PublicKey, addr: &Multiaddr, proof: Vec<u8>) -> Self {
             Self {
                 index,
