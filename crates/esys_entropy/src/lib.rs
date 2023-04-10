@@ -1,7 +1,7 @@
 mod behavior;
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     mem::{replace, take},
     ops::{ControlFlow, RangeInclusive},
@@ -400,10 +400,10 @@ struct Chunk {
     fragment_index: u32,
     fragment: Fragment,
     members: HashMap<PeerId, Member>,
-    indexes: HashMap<u32, PublicKey>,
+    indexes: BTreeMap<u32, PublicKey>,
     // verified but not yet gossip, so not sure whether it has a fragment available already
     // not send to invited nodes to prevent fetch fragment from a premature member
-    joining_members: HashMap<PublicKey, Member>,
+    joining_members: HashMap<PeerId, (PublicKey, Member)>,
 
     enter_time_sec: u64,
     // expiration duration
@@ -455,6 +455,40 @@ impl AppControl {
     // 4. (after all INVITE done) reset <highest taken fragment index> to the `group_size`th lowest taken fragment index
     // (above low watermark)
 
+    pub async fn check_membership(&mut self, chunk_hash: Multihash) {
+        let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
+        chunk.retain_alive(&self.config);
+        if !chunk
+            .members
+            .contains_key(&PeerId::from_public_key(&self.keypair.public()))
+        {
+            self.chunks.remove(&chunk_hash);
+            return;
+        }
+
+        assert!(chunk.fragment_count() >= self.config.fragment_k);
+        self.invite(chunk_hash).await;
+    }
+
+    pub async fn invite(&mut self, chunk_hash: Multihash) {
+        let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
+        // can it get larger then n?
+        if chunk.fragment_count() >= self.config.fragment_n {
+            return;
+        }
+
+        // assume no more node below high watermark is avaiable i.e. can be successfully invited any more
+        chunk.high_watermark += (self.config.fragment_n - chunk.fragment_count()) as u32;
+        let invite_indexes = Vec::from_iter(
+            chunk
+                .watermark(&self.config)
+                .filter(|index| !chunk.indexes.contains_key(index)),
+        );
+        for index in invite_indexes {
+            self.invite_index(chunk_hash, index).await;
+        }
+    }
+
     pub fn gossip(&self, chunk_hash: Multihash) {
         let chunk = &self.chunks[&chunk_hash];
         let request = proto::Request::from(proto::Gossip {
@@ -504,6 +538,12 @@ impl AppControl {
                 if local_member.index == message.fragment_index {
                     local_member.alive = true;
                 }
+            } else if let Some((public_key, mut joining_member)) =
+                chunk.joining_members.remove(&member.id())
+            {
+                joining_member.alive = true;
+                chunk.indexes.insert(member.index, public_key);
+                chunk.members.insert(member.id(), joining_member);
             } else {
                 let peer_id = member.id();
                 let addr = member.addr();
@@ -521,7 +561,7 @@ impl AppControl {
         }
     }
 
-    pub async fn invite(&self, chunk_hash: Multihash, index: u32) {
+    pub async fn invite_index(&self, chunk_hash: Multihash, index: u32) {
         let chunk = &self.chunks[&chunk_hash];
         // TODO check watermarks
         assert!(!chunk.indexes.contains_key(&index));
@@ -662,9 +702,10 @@ impl AppControl {
         }
 
         let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
-        chunk
-            .joining_members
-            .insert(public_key, Member::new(member, false));
+        chunk.joining_members.insert(
+            PeerId::from_public_key(&public_key),
+            (public_key, Member::new(member, false)),
+        );
 
         let Fragment::Complete(fragment) = &chunk.fragment else {
             panic!("receive query fragment before sending gossip")
@@ -858,7 +899,7 @@ impl Chunk {
         let watermark = self.watermark(config);
         let mut members = take(&mut self.members);
         let indexes = take(&mut self.indexes);
-        for (index, public_key) in indexes {
+        for (i, (index, public_key)) in indexes.into_iter().enumerate() {
             let peer_id = PeerId::from_public_key(&public_key);
             if !watermark.contains(&index) || members[&peer_id].index != index {
                 continue;
@@ -869,6 +910,11 @@ impl Chunk {
             }
             self.indexes.insert(index, public_key.clone());
             self.members.insert(peer_id, member);
+
+            if i == config.fragment_n {
+                self.high_watermark = index;
+                break;
+            }
         }
     }
 }
