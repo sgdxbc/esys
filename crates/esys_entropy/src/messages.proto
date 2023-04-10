@@ -53,6 +53,7 @@ message Gossip {
 
 message Member {
     uint32 index = 1;
+    // omitted except in Gossip, derive from public key if needed
     bytes id = 2;
     bytes addr = 3;
     // omitted in Gossip
