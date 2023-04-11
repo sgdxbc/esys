@@ -14,10 +14,15 @@ use tokio::{
     task::yield_now,
     time::sleep,
 };
+use tracing::Instrument;
+use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+        .init();
 
     let server_keypair = Keypair::generate_ed25519();
     let transport = MemoryTransport::new()
@@ -52,17 +57,20 @@ async fn main() {
                 control.serve_kad_add_address();
                 control.listen_on("/memory/0".parse().unwrap());
 
-                sleep(Duration::from_millis(i as u64 * 100)).await;
+                sleep(Duration::from_millis(i as u64 * 10)).await;
                 control.boostrap("/memory/1".parse().unwrap()).await;
-                sleep(Duration::from_secs(3)).await; // wait 30 * 100ms until enough peers (~30) join to form a quorum
+                sleep(Duration::from_millis(300)).await; // wait 30 * 10ms until enough peers (~30) join to form a quorum
                 control.register().await;
 
                 peer_ids.lock().await.push(peer_id);
                 if register_barrier.wait().await.is_leader() {
                     for peer_id in &*peer_ids.lock().await {
-                        tracing::info!(%peer_id, "query");
-                        let result = control.query((*peer_id).into(), 3).await;
-                        tracing::info!(result = ?&result);
+                        let span = tracing::info_span!("query", %peer_id);
+                        let result = control
+                            .query((*peer_id).into(), 3)
+                            .instrument(span.clone())
+                            .await;
+                        tracing::info!(parent: &span, result = ?&result);
                     }
                 }
 

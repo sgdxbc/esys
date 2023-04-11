@@ -36,19 +36,24 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
+use tracing::{
+    debug_span,
+    field::{display, Empty},
+    Instrument,
+};
 
 #[derive(NetworkBehavior)]
 pub struct App {
     identify: Identify,
     kad: Kademlia<MemoryStore>,
-    entropy: behavior::Behavior,
+    rpc: behavior::Behavior,
 }
 
 impl App {
-    fn entropy_ensure_address(&mut self, peer_id: &PeerId, addr: Multiaddr) {
+    fn rpc_ensure_address(&mut self, peer_id: &PeerId, addr: Multiaddr) {
         // silly way to prevent repeated address for a peer to cause problems
-        self.entropy.remove_address(peer_id, &addr);
-        self.entropy.add_address(peer_id, addr);
+        self.rpc.remove_address(peer_id, &addr);
+        self.rpc.add_address(peer_id, addr);
     }
 }
 
@@ -74,7 +79,7 @@ impl App {
                 keypair.public(),
             )),
             kad: Kademlia::new(id, MemoryStore::new(id)),
-            entropy: behavior::Behavior::new(
+            rpc: behavior::Behavior::new(
                 Default::default(),
                 [(behavior::Protocol, ProtocolSupport::Full)],
                 Default::default(),
@@ -82,9 +87,9 @@ impl App {
         };
         let mut swarm = SwarmBuilder::with_tokio_executor(transport, app, id).build();
         let mut ingress = mpsc::unbounded_channel();
-        let control = AppHandle { ingress: ingress.0 };
+        let handle = AppHandle { ingress: ingress.0 };
         let name = name.to_string();
-        let handle = spawn(async move {
+        let event_loop = spawn(async move {
             tracing::trace!("launch app event looop");
             let mut observers = Vec::new();
             loop {
@@ -104,7 +109,7 @@ impl App {
                 }
             }
         });
-        (handle, control)
+        (event_loop, handle)
     }
 }
 
@@ -113,7 +118,7 @@ impl AppHandle {
         self.ingress
             .send(Box::new(|swarm, _| action(swarm)))
             .map_err(|_| ())
-            .expect("app handler outlives control")
+            .expect("event loop outlives handle")
     }
 
     pub fn ingress_wait<T: Send + 'static>(
@@ -121,8 +126,14 @@ impl AppHandle {
         action: impl FnOnce(&mut Swarm<App>) -> T + Send + Sync + 'static,
     ) -> impl Future<Output = T> + Send + 'static {
         let result = oneshot::channel();
-        self.ingress(move |swarm| result.0.send(action(swarm)).map_err(|_| ()).unwrap());
-        async { result.1.await.unwrap() }
+        self.ingress(move |swarm| {
+            result
+                .0
+                .send(action(swarm))
+                .map_err(|_| ())
+                .expect("ingress waiter wait on result")
+        });
+        async { result.1.await.expect("event loop outlives handle") }
     }
 
     pub fn subscribe<T: Send + 'static>(
@@ -140,15 +151,15 @@ impl AppHandle {
                             .unwrap()
                             .send(result)
                             .map_err(|_| ())
-                            .expect("app handler outlives control");
+                            .expect("subcriber wait on result if ever breaking");
                         ControlFlow::Break(())
                     }
                     ControlFlow::Continue(()) => ControlFlow::Continue(()),
                 }))
             }))
             .map_err(|_| ())
-            .expect("app handler outlives control");
-        async move { result_out.await.unwrap() }
+            .expect("event loop outlives handle");
+        async move { result_out.await.expect("event loop outlives handle") }
     }
 
     pub fn listen_on(&self, addr: Multiaddr) {
@@ -164,7 +175,7 @@ impl AppHandle {
         let s = self.subscribe(move |event, swarm| {
             if let SwarmEvent::NewListenAddr { address, .. } = event {
                 if let Some(address) = into_external(address) {
-                    tracing::info!(%address, "add external");
+                    tracing::info!(peer_id = %swarm.local_peer_id(), %address, "add external");
                     swarm.add_external_address(address, AddressScore::Infinite);
                 }
             }
@@ -209,6 +220,7 @@ impl AppHandle {
                 service_id = Some(*peer_id);
                 ControlFlow::Continue(())
             }
+            // assert this happens after the one above
             Behavior(AppEvent::Identify(identify::Event::Received { peer_id, .. }))
                 if Some(*peer_id) == service_id =>
             {
@@ -229,7 +241,7 @@ impl AppHandle {
                 ..
             })) = event
             {
-                assert!(result.is_ok());
+                assert!(result.is_ok(), "then nothing we can do");
                 if step.last {
                     return ControlFlow::Break(());
                 }
@@ -238,10 +250,12 @@ impl AppHandle {
         })
         .await;
 
-        // disabled for now, because when `remove_peer` the connection is closed and service peer cannot provide local
+        // disabled for now, because when `remove_peer` the connection is closed and service peer will not provide local
         // peer's information for further bootstraping
         // the system should be designed in a way so that boostrap peer can proceed as a normal peer for all time. if
         // it cannot, then we still need to workaround to readd this step, or make some more rendezvour mechanism
+        // notice that service peer does not `register`, so it should never participant into RPC and be dedicated for
+        // bootstraping for all the time
 
         // step 4, remove bootstrap peer to avoid contacting it during query
         // let remove_done = oneshot::channel();
@@ -253,17 +267,23 @@ impl AppHandle {
     }
 
     pub async fn register(&self) {
+        let span = debug_span!("register", peer_id = Empty, addr = Empty);
         let put_id = self
-            .ingress_wait(move |swarm| {
-                let addr = &swarm.external_addresses().next().unwrap().addr;
-                tracing::debug!(peer_id = %swarm.local_peer_id(), %addr, "register");
-                let record = Record::new(swarm.local_peer_id().to_bytes(), addr.to_vec());
-                swarm
-                    .behaviour_mut()
-                    .kad
-                    .put_record(record, Quorum::All)
-                    .unwrap()
+            .ingress_wait({
+                let span = span.clone();
+                move |swarm| {
+                    let addr = &swarm.external_addresses().next().unwrap().addr;
+                    span.record("peer_id", display(swarm.local_peer_id()));
+                    span.record("addr", display(addr));
+                    let record = Record::new(swarm.local_peer_id().to_bytes(), addr.to_vec());
+                    swarm
+                        .behaviour_mut()
+                        .kad
+                        .put_record(record, Quorum::All)
+                        .unwrap()
+                }
             })
+            .instrument(span.clone())
             .await;
         self.subscribe(move |event, _| match event {
             Behavior(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
@@ -281,6 +301,7 @@ impl AppHandle {
             }
             _ => ControlFlow::Continue(()),
         })
+        .instrument(span)
         .await
     }
 
@@ -346,7 +367,7 @@ impl AppHandle {
                 _ => ControlFlow::Continue(()),
             })
             .await;
-        tracing::debug!(?peers);
+        // tracing::debug!(?peers);
         let tasks = Vec::from_iter(
             peers
                 .into_iter()
@@ -490,7 +511,10 @@ impl AppControl {
     }
 
     pub fn gossip(&self, chunk_hash: Multihash) {
-        let chunk = &self.chunks[&chunk_hash];
+        let Some(chunk) = self.chunks.get(&chunk_hash) else {
+            // e.g. go below low watermark and get removed in membership timer
+            return;
+        };
         let request = proto::Request::from(proto::Gossip {
             chunk_hash: chunk_hash.to_bytes(),
             fragment_index: chunk.fragment_index,
@@ -506,28 +530,25 @@ impl AppControl {
                 })
                 .collect(),
         });
-        for (peer_id, member) in &chunk.members {
-            if peer_id == &PeerId::from_public_key(&self.keypair.public()) {
+        for (&peer_id, member) in &chunk.members {
+            if peer_id == PeerId::from_public_key(&self.keypair.public()) {
                 continue;
             }
-            let peer_id = *peer_id;
             let peer_addr = member.addr.clone();
             let request = request.clone();
             self.handle.ingress(move |swarm| {
                 swarm
                     .behaviour_mut()
-                    .entropy_ensure_address(&peer_id, peer_addr);
-                swarm
-                    .behaviour_mut()
-                    .entropy
-                    .send_request(&peer_id, request);
+                    .rpc_ensure_address(&peer_id, peer_addr);
+                swarm.behaviour_mut().rpc.send_request(&peer_id, request);
             });
         }
         // TODO reset gossip timer
     }
 
     pub fn handle_gossip(&mut self, message: &proto::Gossip) {
-        let Some(chunk) = self.chunks.get_mut(&message.chunk_hash()) else {
+        let chunk_hash = message.chunk_hash();
+        let Some(chunk) = self.chunks.get_mut(&chunk_hash) else {
             //
             return;
         };
@@ -543,21 +564,22 @@ impl AppControl {
                 chunk.joining_members.remove(&member.id())
             {
                 joining_member.alive = true;
-                chunk.indexes.insert(member.index, public_key);
-                chunk.members.insert(member.id(), joining_member);
+                // it is possible that this `insert` evict local peer itself from the group
+                // later this will cause removing chunk when check membership, so no special treatment here
+                // same for the `insert` in handling QueryProofOk
+                chunk.insert(chunk_hash, public_key, joining_member, &self.config);
                 chunk.retain_alive(&self.config); // shrink high watermark if possible
-            } else {
+            } else if chunk.will_accept(chunk_hash, member.index, &member.id(), &self.config) {
+                // this is also the path for receiving gossip from unseen peer
+                // because the gossip always include sender itself in the `members`
                 let peer_id = member.id();
                 let addr = member.addr();
                 let request = proto::Request::from(proto::QueryProof {
                     chunk_hash: message.chunk_hash.clone(),
                 });
                 self.handle.ingress(move |swarm| {
-                    swarm.behaviour_mut().entropy_ensure_address(&peer_id, addr);
-                    swarm
-                        .behaviour_mut()
-                        .entropy
-                        .send_request(&peer_id, request);
+                    swarm.behaviour_mut().rpc_ensure_address(&peer_id, addr);
+                    swarm.behaviour_mut().rpc.send_request(&peer_id, request);
                 });
             }
         }
@@ -565,46 +587,52 @@ impl AppControl {
 
     async fn invite_index(&self, chunk_hash: Multihash, index: u32) {
         let chunk = &self.chunks[&chunk_hash];
-        // TODO check watermarks
         assert!(!chunk.indexes.contains_key(&index));
+        assert!(chunk.watermark(&self.config).contains(&index));
+
+        let request = proto::Request::from(proto::Invite {
+            chunk_hash: chunk_hash.to_bytes(),
+            fragment_index: index,
+            enter_time_sec: chunk.enter_time_sec,
+            members: chunk
+                .members
+                .values()
+                .map(|member| {
+                    proto::Member::new_trustless(
+                        member.index,
+                        &chunk.indexes[&member.index],
+                        &member.addr,
+                    )
+                })
+                .collect(),
+        });
         for (peer_id, peer_addr) in self
             .handle
-            .query(Self::fragment_hash(chunk_hash, index), 1) // TODO configure this
+            .query(
+                Self::fragment_hash(chunk_hash, index),
+                self.config.invite_count,
+            )
             .await
         {
             // if chunk.members.contains_key(&peer_id) {
             //     continue;
             // }
+            //
             // skip this check may cause some member to be re-invited (with low probability hopefully)
             // which will be ignored by honest members, and a faulty member may try duplicated join anyway regardless
             // of this inviting (and will be rejected), so it's fine
+            //
+            // however, should we filter out `joining_memebers` in some way?
+
             let Some(peer_addr) = peer_addr else {
                 continue;
             };
-            let request = proto::Request::from(proto::Invite {
-                chunk_hash: chunk_hash.to_bytes(),
-                fragment_index: index,
-                enter_time_sec: chunk.enter_time_sec,
-                members: chunk
-                    .members
-                    .values()
-                    .map(|member| {
-                        proto::Member::new_trustless(
-                            member.index,
-                            &chunk.indexes[&member.index],
-                            &member.addr,
-                        )
-                    })
-                    .collect(),
-            });
+            let request = request.clone();
             self.handle.ingress(move |swarm| {
                 swarm
                     .behaviour_mut()
-                    .entropy_ensure_address(&peer_id, peer_addr);
-                swarm
-                    .behaviour_mut()
-                    .entropy
-                    .send_request(&peer_id, request);
+                    .rpc_ensure_address(&peer_id, peer_addr);
+                swarm.behaviour_mut().rpc.send_request(&peer_id, request);
             });
         }
     }
@@ -612,18 +640,16 @@ impl AppControl {
     pub async fn handle_invite(&mut self, message: &proto::Invite) {
         let chunk_hash = message.chunk_hash();
         if self.chunks.contains_key(&chunk_hash) {
-            return; //
+            return; // need merge?
         }
+
         let Some(proof) = self.prove(chunk_hash, message.fragment_index) else {
             //
             return;
         };
 
-        if message.members.len() < self.config.fragment_k {
-            //
-            return;
-        }
-        // however we are not sure whether it is valid even after this test = =
+        assert!(message.members.len() >= self.config.fragment_k);
+        // however we are not sure whether it is valid even after this assert = =
 
         let mut chunk = Chunk {
             fragment_index: message.fragment_index,
@@ -644,18 +670,18 @@ impl AppControl {
                 .unwrap(),
         };
 
-        chunk.members.insert(
-            PeerId::from_public_key(&self.keypair.public()),
+        let inserted = chunk.insert(
+            chunk_hash,
+            self.keypair.public(),
             Member {
                 index: chunk.fragment_index,
                 addr: self.addr.clone(),
                 proof: proof.clone(),
                 alive: true,
             },
+            &self.config,
         );
-        chunk
-            .indexes
-            .insert(message.fragment_index, self.keypair.public());
+        assert!(inserted);
         self.chunks.insert(chunk_hash, chunk);
 
         // do we really don't need to retry the following?
@@ -673,11 +699,8 @@ impl AppControl {
             let addr = member.addr();
             let request = request.clone();
             self.handle.ingress(move |swarm| {
-                swarm.behaviour_mut().entropy_ensure_address(&peer_id, addr);
-                swarm
-                    .behaviour_mut()
-                    .entropy
-                    .send_request(&peer_id, request);
+                swarm.behaviour_mut().rpc_ensure_address(&peer_id, addr);
+                swarm.behaviour_mut().rpc.send_request(&peer_id, request);
             });
         }
     }
@@ -724,7 +747,7 @@ impl AppControl {
         self.handle.ingress(move |swarm| {
             swarm
                 .behaviour_mut()
-                .entropy
+                .rpc
                 .send_response(channel, response)
                 .unwrap();
         });
@@ -744,7 +767,7 @@ impl AppControl {
             return;
         }
         // unconditionally insert members that are queried previously
-        // mostly for simplify stuff, and should not break anything
+        // mostly for simplifying stuff, and should not break anything
         let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
         chunk.members.insert(
             PeerId::from_public_key(&public_key),
@@ -782,6 +805,7 @@ impl AppControl {
             .unwrap();
         let _ = replace(&mut chunk.fragment, Fragment::Complete(fragment));
 
+        // immediately check membership before sending first gossip?
         self.gossip(chunk_hash);
         // TODO start membership timer
     }
@@ -810,7 +834,7 @@ impl AppControl {
         self.handle.ingress(move |swarm| {
             swarm
                 .behaviour_mut()
-                .entropy
+                .rpc
                 .send_response(channel, response)
                 .unwrap();
         });
@@ -829,11 +853,12 @@ impl AppControl {
             return;
         }
         let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
-        chunk.members.insert(
-            PeerId::from_public_key(&public_key),
+        chunk.insert(
+            chunk_hash,
+            public_key,
             Member::new(member, true),
+            &self.config,
         );
-        chunk.indexes.insert(member.index, public_key);
         chunk.retain_alive(&self.config); // shrink high watermark if possible
     }
 
@@ -929,7 +954,11 @@ impl Chunk {
             if !watermark.contains(&index) || members[&peer_id].index != index {
                 continue;
             };
-            let member = members.remove(&peer_id).unwrap();
+            // if a member show up for multiple indexes, it should be removed for the lowest index among those, and
+            // high indexes will be released here
+            let Some(member) = members.remove(&peer_id) else {
+                continue;
+            };
             if !member.alive {
                 continue;
             }
@@ -937,11 +966,56 @@ impl Chunk {
             self.members.insert(peer_id, member);
             alive_count += 1;
 
+            // all higher indexes are released, shrinking the high watermark
             if alive_count == config.fragment_n {
                 self.high_watermark = index;
                 break;
             }
         }
+    }
+
+    fn will_accept(
+        &self,
+        chunk_hash: Multihash,
+        index: u32,
+        peer_id: &PeerId,
+        config: &AppConfig,
+    ) -> bool {
+        if !self.watermark(config).contains(&index) {
+            return false;
+        }
+        let Some(member_key) = self.indexes.get(&index) else {
+            return true;
+        };
+        let d = |peer_id: &PeerId| {
+            kbucket::Key::from(peer_id.to_bytes()).distance(&kbucket::Key::from(chunk_hash))
+        };
+        // check member exist?
+        d(peer_id) < d(&PeerId::from_public_key(member_key))
+    }
+
+    fn insert(
+        &mut self,
+        chunk_hash: Multihash,
+        public_key: PublicKey,
+        member: Member,
+        config: &AppConfig,
+    ) -> bool {
+        assert!(member.alive);
+        // assert will accept?
+        if !self.will_accept(
+            chunk_hash,
+            member.index,
+            &PeerId::from_public_key(&public_key),
+            config,
+        ) {
+            return false;
+        }
+        let index = member.index;
+        self.members
+            .insert(PeerId::from_public_key(&public_key), member);
+        self.indexes.insert(index, public_key);
+        true
     }
 }
 
