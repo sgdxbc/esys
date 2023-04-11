@@ -56,6 +56,7 @@ struct Config {
     fragment_k: u32,
     allow_data_lost: bool,
     targeted_count: u32,
+    cache_sec: u32,
 }
 
 #[derive(Debug)]
@@ -104,6 +105,7 @@ struct Chunk {
     // lowest fragment that has not yet (tried to) be included in the group
     next_fragment: FragmentId,
     targeted: bool,
+    last_repair_sec: u32,
 }
 
 type Instant = u32;
@@ -117,7 +119,7 @@ struct Stats {
     churn: u32,
     data_lost: u32,
     targeted: u32,
-    repair: f32,
+    repair: f64,
 }
 
 impl System {
@@ -245,6 +247,7 @@ impl System {
         while (self.chunk(object_id, chunk_id).fragments.len() as u32) < self.config.fragment_n {
             self.add_fragment(object_id, chunk_id, &mut rng);
         }
+        self.chunk_mut(object_id, chunk_id).last_repair_sec = self.now;
     }
 
     fn lose_chunk(&mut self, object_id: ObjectId, chunk_id: ChunkId) {
@@ -287,12 +290,18 @@ impl System {
         if !faulty {
             chunk.alive_count += 1;
         }
+        let last_repair_sec = chunk.last_repair_sec;
 
         if chunk.targeted {
             self.targeted_nodes.insert(node_id);
         }
 
-        self.stats.repair += 1. / self.config.chunk_k as f32; // TODO simulate caching
+        let repair = if self.now - last_repair_sec < self.config.cache_sec {
+            1. / self.config.chunk_k as f64 / self.config.fragment_k as f64
+        } else {
+            1. / self.config.chunk_k as f64
+        };
+        self.stats.repair += repair;
     }
 
     fn remove_fragment(
@@ -403,28 +412,32 @@ impl System {
 
 impl Config {
     fn increase_watermark_interval_sec(&self) -> u32 {
-        (365. * 86400. / self.churn_rate / self.fragment_n as f32) as _
-        // 365 * 86400 * 100 // disable
+        // (365. * 86400. / self.churn_rate / self.fragment_n as f32) as _
+        365 * 86400 * 100 // disable
     }
 }
 
 fn main() {
     let config = Config {
-        churn_rate: 0.1,
+        churn_rate: 2.,
         node_count: 100000,
         duration: 10,
         faulty_rate: 0.,
-        object_count: 100,
+        object_count: 1,
 
-        chunk_n: 100,
-        chunk_k: 80,
-        fragment_n: 500,
-        fragment_k: 200,
-
-        // chunk_n: 1,
-        // chunk_k: 1,
+        // chunk_n: 100,
+        // chunk_k: 80,
         // fragment_n: 500,
         // fragment_k: 200,
+        // cache_sec: 0,
+        //
+        // kademlia setup, use with disabled watermark increment
+        chunk_n: 1,
+        chunk_k: 1,
+        fragment_n: 625,
+        fragment_k: 200,
+        cache_sec: 365 * 86400 * 100, // traffic equivalent to always cache hit
+        //
         allow_data_lost: true,
         targeted_count: 0,
     };
@@ -435,7 +448,7 @@ fn main() {
     );
 
     let mut seeder = StdRng::seed_from_u64(3141592653589793238);
-    Vec::from_iter(repeat_with(|| StdRng::from_rng(&mut seeder).unwrap()).take(10))
+    Vec::from_iter(repeat_with(|| StdRng::from_rng(&mut seeder).unwrap()).take(16))
         .into_par_iter()
         .for_each(|mut rng| {
             let mut system = System::new(config.clone(), &mut rng);
