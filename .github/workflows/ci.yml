@@ -1,0 +1,66 @@
+on: 
+  push:
+  pull_request:
+  schedule:
+    # run it whenever Rust release a new version
+    # it's a little harder to do a exact six week in cron, so using a month instead
+    - cron: '0 0 1 * *'
+
+name: Continuous integration
+
+jobs:
+  all:
+    name: All
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: true
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - run: rustup component add rustfmt clippy
+      - run: sudo snap install --classic protobuf
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+      - uses: actions-rs/cargo@v1
+        with:
+          command: check
+      - uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+      - uses: actions-rs/cargo@v1
+        with:
+          command: test
+      - uses: actions-rs/cargo@v1
+        with:
+          command: run
+          args: --example routable
+
+  all-beta:
+    name: All (Beta)
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: true
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: beta
+          override: true
+      - run: sudo snap install --classic protobuf
+
+      - uses: actions-rs/cargo@v1
+        with:
+          command: test
+      - uses: actions-rs/cargo@v1
+        with:
+          command: run
+          args: --example routable
