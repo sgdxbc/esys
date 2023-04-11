@@ -37,10 +37,11 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: test
+          args: --release
       - uses: actions-rs/cargo@v1
         with:
           command: run
-          args: --example routable
+          args: --release --example routable
 
   all-beta:
     name: All (Beta)
@@ -60,7 +61,8 @@ jobs:
       - uses: actions-rs/cargo@v1
         with:
           command: test
+          args: --release
       - uses: actions-rs/cargo@v1
         with:
           command: run
-          args: --example routable
+          args: --release --example routable

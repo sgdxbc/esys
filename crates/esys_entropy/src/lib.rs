@@ -63,8 +63,9 @@ pub struct AppHandle {
 }
 
 type IngressTask = Box<dyn FnOnce(&mut Swarm<App>, &mut Vec<AppObserver>) + Send>;
-pub type AppObserver = Box<dyn FnMut(&ControlEvent, &mut Swarm<App>) -> ControlFlow<()> + Send>;
-pub type ControlEvent = SwarmEvent<AppEvent, HandlerErr<App>>;
+pub type AppObserver =
+    Box<dyn FnMut(&mut Option<ObserverEvent>, &mut Swarm<App>) -> ControlFlow<()> + Send>;
+pub type ObserverEvent = SwarmEvent<AppEvent, HandlerErr<App>>;
 
 impl App {
     pub fn run(
@@ -101,10 +102,13 @@ impl App {
                         };
                         action(&mut swarm, &mut observers);
                     }
-                    event = swarm.next() => {
-                        let event = event.unwrap();
+                    mut event = swarm.next() => {
                         tracing::trace!(name, ?event);
-                        observers.retain_mut(|observer| matches!(observer(&event, &mut swarm), ControlFlow::Continue(())));
+                        for mut observer in take(&mut observers) {
+                            if event.is_none() || observer(&mut event, &mut swarm).is_continue() {
+                                observers.push(observer);
+                            }
+                        }
                     }
                 }
             }
@@ -138,7 +142,9 @@ impl AppHandle {
 
     pub fn subscribe<T: Send + 'static>(
         &self,
-        mut observer: impl FnMut(&ControlEvent, &mut Swarm<App>) -> ControlFlow<T> + Send + 'static,
+        mut observer: impl FnMut(&mut Option<ObserverEvent>, &mut Swarm<App>) -> ControlFlow<T>
+            + Send
+            + 'static,
     ) -> impl Future<Output = T> + Send + 'static {
         let (result_in, result_out) = oneshot::channel();
         let mut result_in = Some(result_in);
@@ -173,11 +179,12 @@ impl AppHandle {
         mut into_external: impl FnMut(&Multiaddr) -> Option<Multiaddr> + Send + 'static,
     ) {
         let s = self.subscribe(move |event, swarm| {
-            if let SwarmEvent::NewListenAddr { address, .. } = event {
+            if let SwarmEvent::NewListenAddr { address, .. } = event.as_ref().unwrap() {
                 if let Some(address) = into_external(address) {
                     tracing::info!(peer_id = %swarm.local_peer_id(), %address, "add external");
                     swarm.add_external_address(address, AddressScore::Infinite);
                 }
+                *event = None;
             }
             ControlFlow::<()>::Continue(())
         });
@@ -186,7 +193,8 @@ impl AppHandle {
 
     pub fn serve_kad_add_address(&self) {
         let s = self.subscribe(|event, swarm| {
-            if let Behavior(AppEvent::Identify(identify::Event::Received { peer_id, info })) = event
+            if let Behavior(AppEvent::Identify(identify::Event::Received { peer_id, info })) =
+                event.as_ref().unwrap()
             {
                 swarm.behaviour_mut().kad.add_address(
                     peer_id,
@@ -211,7 +219,7 @@ impl AppHandle {
 
         // step 2, wait until boostrap service peer id is recorded into kademlia
         let mut service_id = None;
-        self.subscribe(move |event, _| match event {
+        self.subscribe(move |event, _| match event.as_ref().unwrap() {
             SwarmEvent::ConnectionEstablished {
                 peer_id,
                 endpoint: ConnectedPoint::Dialer { address, .. },
@@ -239,12 +247,13 @@ impl AppHandle {
                 result: QueryResult::Bootstrap(result),
                 step,
                 ..
-            })) = event
+            })) = event.as_ref().unwrap()
             {
-                assert!(result.is_ok(), "then nothing we can do");
+                assert!(result.is_ok(), "then there's nothing we can do");
                 if step.last {
                     return ControlFlow::Break(());
                 }
+                *event = None;
             }
             ControlFlow::Continue(())
         })
@@ -285,7 +294,7 @@ impl AppHandle {
             })
             .instrument(span.clone())
             .await;
-        self.subscribe(move |event, _| match event {
+        self.subscribe(move |event, _| match event.as_ref().unwrap() {
             Behavior(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
                 id,
                 result: QueryResult::PutRecord(result),
@@ -297,6 +306,7 @@ impl AppHandle {
                         "put record quorum failed, should not happen if launched sufficient peers"
                     );
                 }
+                *event = None;
                 ControlFlow::Break(())
             }
             _ => ControlFlow::Continue(()),
@@ -311,25 +321,28 @@ impl AppHandle {
             .ingress_wait(move |swarm| swarm.behaviour_mut().kad.get_record(key))
             .await;
         // tracing::debug!(%peer_id, ?get_id);
-        self.subscribe(move |event, swarm| match event {
+        self.subscribe(move |event, swarm| match event.take().unwrap() {
             Behavior(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
                 id,
                 result: QueryResult::GetRecord(result),
                 ..
-            })) if *id == get_id => {
+            })) if id == get_id => {
                 let result = match result {
                     Ok(GetRecordOk::FoundRecord(result)) => {
-                        if let Some(mut query) = swarm.behaviour_mut().kad.query_mut(id) {
+                        if let Some(mut query) = swarm.behaviour_mut().kad.query_mut(&id) {
                             query.finish()
                         }
-                        Some(Multiaddr::try_from(result.record.value.clone()).unwrap())
+                        Some(Multiaddr::try_from(result.record.value).unwrap())
                     }
                     Err(GetRecordError::NotFound { .. }) => None,
                     _ => unreachable!("either FoundRecord or NotFound should be delivered before"),
                 };
                 ControlFlow::Break(result)
             }
-            _ => ControlFlow::Continue(()),
+            other_event => {
+                *event = Some(other_event);
+                ControlFlow::Continue(())
+            }
         })
         .await
     }
@@ -340,19 +353,19 @@ impl AppHandle {
             .ingress_wait(move |swarm| swarm.behaviour_mut().kad.get_closest_peers(key))
             .await;
         let peers = self
-            .subscribe(move |event, swarm| match event {
+            .subscribe(move |event, swarm| match event.take().unwrap() {
                 Behavior(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
                     id,
                     result: QueryResult::GetClosestPeers(result),
                     ..
-                })) if *id == find_id => {
+                })) if id == find_id => {
                     let Ok(result) = result else {
                         unimplemented!()
                     };
                     // kad excludes local peer id from `GetClosestPeers` result for unknown reason
                     // so by default, the result from closest peers themselves is different from the others
                     // add this workaround to restore a consistent result
-                    let mut peers = result.peers.clone();
+                    let mut peers = result.peers;
                     let k = |peer_id: &PeerId| {
                         kbucket::Key::from(*peer_id).distance(&kbucket::Key::from(key))
                     };
@@ -364,7 +377,10 @@ impl AppHandle {
                     peers.pop();
                     ControlFlow::Break(peers)
                 }
-                _ => ControlFlow::Continue(()),
+                other_event => {
+                    *event = Some(other_event);
+                    ControlFlow::Continue(())
+                }
             })
             .await;
         // tracing::debug!(?peers);
@@ -395,7 +411,11 @@ fn is_global(addr: &Multiaddr) -> bool {
 }
 
 pub struct AppControl {
-    pub handle: AppHandle,
+    handle: AppHandle,
+    control: (
+        mpsc::UnboundedSender<ControlEvent>,
+        mpsc::UnboundedReceiver<ControlEvent>,
+    ),
     keypair: Keypair,
     addr: Multiaddr,
     chunks: HashMap<Multihash, Chunk>,
@@ -443,16 +463,39 @@ enum Fragment {
     Complete(Vec<u8>),
 }
 
+#[derive(Debug)]
+enum ControlEvent {
+    Close,
+    Rpc(<behavior::Behavior as NetworkBehavior>::OutEvent),
+    Gossip(Multihash),
+    Invite(Multihash),
+    // client request
+}
+
 impl AppControl {
     pub fn new(handle: AppHandle, keypair: Keypair, addr: Multiaddr, config: AppConfig) -> Self {
         Self {
             handle,
+            control: mpsc::unbounded_channel(),
             chunks: Default::default(),
             addr,
             keypair,
             config,
         }
     }
+
+    // pub async fn serve(&mut self) {
+    //     let control = self.control.0.clone();
+    //     let s = self.handle.subscribe(|event, swarm| {
+    //         if let Behavior(AppEvent::Rpc(event)) = event {
+    //             if control.send(ControlEvent::Rpc(event.clone)).is_err() {
+    //                 return ControlFlow::Break(());
+    //             }
+    //         }
+    //         ControlFlow::Continue(())
+    //     });
+    //     drop(s);
+    // }
 
     // entropy message flow
     // precondition: a group of peers that hold identical `members` view
