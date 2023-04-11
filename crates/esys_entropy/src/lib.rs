@@ -22,7 +22,7 @@ use libp2p::{
     },
     multiaddr,
     multihash::{Code, Hasher, Multihash, MultihashDigest, Sha2_256},
-    request_response::{ProtocolSupport, ResponseChannel},
+    request_response::{Message, ProtocolSupport, ResponseChannel},
     swarm::{
         AddressScore, NetworkBehaviour as NetworkBehavior, SwarmBuilder,
         SwarmEvent::{self, Behaviour as Behavior},
@@ -30,11 +30,12 @@ use libp2p::{
     },
     Multiaddr, PeerId, Swarm,
 };
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
 use tokio::{
     select, spawn,
     sync::{mpsc, oneshot},
     task::JoinHandle,
+    time::sleep,
 };
 use tracing::{
     debug_span,
@@ -465,9 +466,10 @@ enum Fragment {
 
 #[derive(Debug)]
 enum ControlEvent {
-    Close,
+    // Close,
     Rpc(<behavior::Behavior as NetworkBehavior>::OutEvent),
     Gossip(Multihash),
+    Membership(Multihash),
     Invite(Multihash),
     // client request
 }
@@ -484,18 +486,61 @@ impl AppControl {
         }
     }
 
-    // pub async fn serve(&mut self) {
-    //     let control = self.control.0.clone();
-    //     let s = self.handle.subscribe(|event, swarm| {
-    //         if let Behavior(AppEvent::Rpc(event)) = event {
-    //             if control.send(ControlEvent::Rpc(event.clone)).is_err() {
-    //                 return ControlFlow::Break(());
-    //             }
-    //         }
-    //         ControlFlow::Continue(())
-    //     });
-    //     drop(s);
-    // }
+    pub async fn serve(&mut self) {
+        let control = self.control.0.clone();
+        let s = self.handle.subscribe(move |event, _| {
+            match event.take().unwrap() {
+                Behavior(AppEvent::Rpc(event)) => {
+                    if control.send(ControlEvent::Rpc(event)).is_err() {
+                        return ControlFlow::Break(());
+                    }
+                }
+                other_event => {
+                    *event = Some(other_event);
+                }
+            }
+            ControlFlow::Continue(())
+        });
+        drop(s);
+
+        while let Some(event) = self.control.1.recv().await {
+            use proto::{request::Inner::*, response::Inner::*};
+            match event {
+                // ControlEvent::Close => break,
+                ControlEvent::Gossip(chunk_hash) => self.gossip(&chunk_hash),
+                ControlEvent::Membership(chunk_hash) => self.check_membership(&chunk_hash).await,
+                ControlEvent::Invite(chunk_hash) => self.invite(&chunk_hash).await,
+                ControlEvent::Rpc(libp2p::request_response::Event::Message {
+                    message:
+                        Message::Request {
+                            request, channel, ..
+                        },
+                    ..
+                }) => match request.inner.unwrap() {
+                    Gossip(message) => self.handle_gossip(&message), // no response
+                    Invite(message) => self.handle_invite(&message), // no response
+                    QueryFragment(message) => self.handle_query_fragment(&message, channel),
+                    QueryProof(message) => self.handle_query_proof(&message, channel),
+                },
+                ControlEvent::Rpc(libp2p::request_response::Event::Message {
+                    message: Message::Response { response, .. },
+                    ..
+                }) => match response.inner.unwrap() {
+                    QueryFragmentOk(message) => self.handle_query_fragment_ok(&message),
+                    QueryProofOk(message) => self.handle_query_proof_ok(&message),
+                },
+                ControlEvent::Rpc(_) => {} // do anything?
+            }
+        }
+    }
+
+    fn set_timer(&self, duration: Duration, event: ControlEvent) {
+        let control = self.control.0.clone();
+        spawn(async move {
+            sleep(duration).await;
+            let _ = control.send(event); // could fail if outlive event loop
+        });
+    }
 
     // entropy message flow
     // precondition: a group of peers that hold identical `members` view
@@ -517,24 +562,27 @@ impl AppControl {
     // 4. (after all INVITE done) reset <highest taken fragment index> to the `group_size`th lowest taken fragment index
     // (above low watermark)
 
-    pub async fn check_membership(&mut self, chunk_hash: Multihash) {
-        let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
+    async fn check_membership(&mut self, chunk_hash: &Multihash) {
+        let chunk = self.chunks.get_mut(chunk_hash).unwrap();
         chunk.retain_alive(&self.config);
         if !chunk
             .members
             .contains_key(&PeerId::from_public_key(&self.keypair.public()))
         {
-            self.chunks.remove(&chunk_hash);
+            self.chunks.remove(chunk_hash);
             return;
         }
 
         assert!(chunk.fragment_count() >= self.config.fragment_k);
         self.invite(chunk_hash).await;
-        // TODO reset check membership timer
+        self.set_timer(
+            self.config.membership_interval,
+            ControlEvent::Membership(*chunk_hash),
+        );
     }
 
-    pub async fn invite(&mut self, chunk_hash: Multihash) {
-        let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
+    async fn invite(&mut self, chunk_hash: &Multihash) {
+        let chunk = self.chunks.get_mut(chunk_hash).unwrap();
         // can it get larger then n?
         if chunk.fragment_count() >= self.config.fragment_n {
             return;
@@ -550,11 +598,14 @@ impl AppControl {
         for index in invite_indexes {
             self.invite_index(chunk_hash, index).await;
         }
-        // TODO reset invite timer
+        self.set_timer(
+            self.config.invite_interval,
+            ControlEvent::Invite(*chunk_hash),
+        );
     }
 
-    pub fn gossip(&self, chunk_hash: Multihash) {
-        let Some(chunk) = self.chunks.get(&chunk_hash) else {
+    fn gossip(&self, chunk_hash: &Multihash) {
+        let Some(chunk) = self.chunks.get(chunk_hash) else {
             // e.g. go below low watermark and get removed in membership timer
             return;
         };
@@ -586,10 +637,13 @@ impl AppControl {
                 swarm.behaviour_mut().rpc.send_request(&peer_id, request);
             });
         }
-        // TODO reset gossip timer
+        self.set_timer(
+            self.config.gossip_interval,
+            ControlEvent::Gossip(*chunk_hash),
+        );
     }
 
-    pub fn handle_gossip(&mut self, message: &proto::Gossip) {
+    fn handle_gossip(&mut self, message: &proto::Gossip) {
         let chunk_hash = message.chunk_hash();
         let Some(chunk) = self.chunks.get_mut(&chunk_hash) else {
             //
@@ -628,8 +682,8 @@ impl AppControl {
         }
     }
 
-    async fn invite_index(&self, chunk_hash: Multihash, index: u32) {
-        let chunk = &self.chunks[&chunk_hash];
+    async fn invite_index(&self, chunk_hash: &Multihash, index: u32) {
+        let chunk = &self.chunks[chunk_hash];
         assert!(!chunk.indexes.contains_key(&index));
         assert!(chunk.watermark(&self.config).contains(&index));
 
@@ -652,7 +706,7 @@ impl AppControl {
         for (peer_id, peer_addr) in self
             .handle
             .query(
-                Self::fragment_hash(&chunk_hash, index),
+                Self::fragment_hash(chunk_hash, index),
                 self.config.invite_count,
             )
             .await
@@ -680,7 +734,7 @@ impl AppControl {
         }
     }
 
-    pub async fn handle_invite(&mut self, message: &proto::Invite) {
+    fn handle_invite(&mut self, message: &proto::Invite) {
         let chunk_hash = message.chunk_hash();
         if self.chunks.contains_key(&chunk_hash) {
             return; // need merge?
@@ -748,7 +802,7 @@ impl AppControl {
         }
     }
 
-    pub fn handle_query_fragment(
+    fn handle_query_fragment(
         &mut self,
         message: &proto::QueryFragment,
         channel: ResponseChannel<proto::Response>,
@@ -796,7 +850,7 @@ impl AppControl {
         });
     }
 
-    pub fn handle_query_fragment_ok(&mut self, message: &proto::QueryFragmentOk) {
+    fn handle_query_fragment_ok(&mut self, message: &proto::QueryFragmentOk) {
         let member = message.member.as_ref().unwrap();
         let chunk_hash = message.chunk_hash();
         if !self.chunks.contains_key(&chunk_hash) {
@@ -849,8 +903,13 @@ impl AppControl {
         let _ = replace(&mut chunk.fragment, Fragment::Complete(fragment));
 
         // immediately check membership before sending first gossip?
-        self.gossip(chunk_hash);
-        // TODO start membership timer
+        self.gossip(&chunk_hash);
+        // randomize first membership checking delay to (hopefully) avoid duplicated invitation
+        self.set_timer(
+            self.config.membership_interval
+                + thread_rng().gen_range(Duration::ZERO..self.config.membership_interval),
+            ControlEvent::Membership(chunk_hash),
+        );
     }
 
     pub fn handle_query_proof(

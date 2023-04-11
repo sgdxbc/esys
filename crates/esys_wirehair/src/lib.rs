@@ -71,7 +71,7 @@ extern "C" {
         message_out: *mut c_void,
         message_bytes: u64,
     ) -> WirehairResult;
-    pub fn wirehair_decoder_become_encoder(codec: *mut WirehairCodecRaw) -> WirehairResult;
+    pub fn wirehair_decoder_becomes_encoder(codec: *mut WirehairCodecRaw) -> WirehairResult;
     pub fn wirehair_free(codec: *mut WirehairCodecRaw);
 }
 
@@ -173,7 +173,7 @@ impl WirehairDecoder {
 
     pub fn into_encoder(mut self) -> Result<WirehairEncoder, WirehairResult> {
         self.converted = true;
-        unsafe { wirehair_decoder_become_encoder(self.raw) }.with(WirehairEncoder {
+        unsafe { wirehair_decoder_becomes_encoder(self.raw) }.with(WirehairEncoder {
             raw: self.raw,
             block_bytes: self.block_bytes,
         })
