@@ -31,16 +31,19 @@
 // nodes is recorded, and the maximum of these recorded targeted node count is considered as the peak attacking
 // effort/power and will be plotted.
 
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 // use std::collections::{BTreeMap, HashMap, HashSet};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, iter::repeat_with};
 
 use rand::{
+    rngs::StdRng,
     seq::{IteratorRandom, SliceRandom},
-    thread_rng, Rng,
+    Rng, SeedableRng,
 };
 use rand_distr::{Distribution, Poisson};
 
+#[derive(Debug, Clone)]
 struct Config {
     churn_rate: f32,  // nodes leaving in one year / node count
     faulty_rate: f32, // faulty node count / node count
@@ -401,24 +404,58 @@ impl System {
 impl Config {
     fn increase_watermark_interval_sec(&self) -> u32 {
         (365. * 86400. / self.churn_rate / self.fragment_n as f32) as _
+        // 365 * 86400 * 100 // disable
     }
 }
 
 fn main() {
     let config = Config {
         churn_rate: 0.1,
-        node_count: 10000,
+        node_count: 100000,
         duration: 10,
-        faulty_rate: 0.33,
+        faulty_rate: 0.,
         object_count: 100,
+
         chunk_n: 100,
         chunk_k: 80,
         fragment_n: 500,
         fragment_k: 200,
+
+        // chunk_n: 1,
+        // chunk_k: 1,
+        // fragment_n: 500,
+        // fragment_k: 200,
         allow_data_lost: true,
         targeted_count: 0,
     };
-    let mut system = System::new(config, thread_rng());
-    system.run(thread_rng());
-    println!("{:?}", system.stats);
+
+    println!(
+        "churn_rate,node_count,duration,faulty_rate,object_count,chunk_n,chunk_k,\
+        fragment_n,fragment_k,targeted_count,data_lost,targeted,repair"
+    );
+
+    let mut seeder = StdRng::seed_from_u64(3141592653589793238);
+    Vec::from_iter(repeat_with(|| StdRng::from_rng(&mut seeder).unwrap()).take(10))
+        .into_par_iter()
+        .for_each(|mut rng| {
+            let mut system = System::new(config.clone(), &mut rng);
+            system.run(rng);
+            // println!("{:?}", system.stats);
+            println!(
+                "{},{},{},{},{},{},{},{},{},{},{},{},{}",
+                config.churn_rate,
+                config.node_count,
+                config.duration,
+                config.faulty_rate,
+                config.object_count,
+                config.chunk_n,
+                config.chunk_k,
+                config.fragment_n,
+                config.fragment_k,
+                config.targeted_count,
+                system.stats.data_lost,
+                system.stats.targeted,
+                system.stats.repair
+            );
+        })
 }

@@ -14,7 +14,6 @@ Prepare control node
 * Install Rust toolchain, C++ toolchain, CMake, Protocol Buffers toolchain, Terraform, Ansible
 * Set up AWS credential properly, so it has EC2 and VPC permissions
 * Add this section to SSH config
-
 ```
 Host *.compute.amazonaws.com
     StrictHostKeyChecking no

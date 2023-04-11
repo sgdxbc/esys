@@ -6,7 +6,7 @@ use libp2p::{
     core::upgrade::Version::V1,
     identity::Keypair,
     multiaddr::{multiaddr, Protocol},
-    tcp, Swarm, Transport,
+    tcp, Multiaddr, Swarm, Transport,
 };
 use rand::{thread_rng, Rng};
 use tokio::{signal::ctrl_c, spawn, task::JoinHandle, time::sleep};
@@ -29,17 +29,15 @@ async fn main() {
     let cli = Cli::parse();
 
     if cli.bootstrap_service {
-        let app = start_app(&cli);
+        let app = start_app(&cli).await;
         // handle.await.unwrap();
         ctrl_c().await.unwrap();
         drop(app.handle);
         app.event_loop.await.unwrap();
     } else {
-        let mut event_loops = Vec::new();
         let mut tasks = Vec::new();
         for _ in 0..cli.n {
-            let app = start_app(&cli);
-            event_loops.push(app.event_loop);
+            let app = start_app(&cli).await;
             let task = spawn(async move {
                 let delay = thread_rng().gen_range(0..5 * 1000);
                 sleep(Duration::from_millis(delay)).await;
@@ -48,7 +46,7 @@ async fn main() {
                     .await;
                 sleep(Duration::from_millis(5000)).await;
                 app.handle.register().await;
-                (app.handle, app.keypair)
+                app
             });
             tasks.push(task);
         }
@@ -58,15 +56,15 @@ async fn main() {
             apps.push(task.await.unwrap());
         }
         tracing::info!("peers register done");
-        for (handle, keypair) in apps {
+
+        let mut event_loops = Vec::new();
+        for app in apps {
+            event_loops.push(app.event_loop);
             spawn(async move {
-                let addr = handle
-                    .ingress_wait(|swarm| swarm.external_addresses().next().unwrap().addr.clone())
-                    .await;
                 let mut control = AppControl::new(
-                    handle,
-                    keypair,
-                    addr,
+                    app.handle,
+                    app.keypair,
+                    app.addr,
                     AppConfig {
                         invite_count: 0,
                         fragment_k: 0,
@@ -83,9 +81,8 @@ async fn main() {
         }
 
         ctrl_c().await.unwrap();
-        // drop(apps);
-        for handle in event_loops {
-            handle.await.unwrap();
+        for event_loop in event_loops {
+            event_loop.await.unwrap();
         }
     }
 }
@@ -94,9 +91,10 @@ struct StartApp {
     event_loop: JoinHandle<Swarm<App>>,
     handle: AppHandle,
     keypair: Keypair,
+    addr: Multiaddr,
 }
 
-fn start_app(cli: &Cli) -> StartApp {
+async fn start_app(cli: &Cli) -> StartApp {
     let id_keys = Keypair::generate_ed25519();
     let transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
         .upgrade(V1)
@@ -121,9 +119,13 @@ fn start_app(cli: &Cli) -> StartApp {
         Ip4(0),
         Tcp(if cli.bootstrap_service { 8500u16 } else { 0 })
     ));
+    let addr = handle
+        .ingress_wait(|swarm| swarm.external_addresses().next().unwrap().addr.clone())
+        .await;
     StartApp {
         event_loop,
         handle,
         keypair: id_keys,
+        addr,
     }
 }
