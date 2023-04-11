@@ -567,9 +567,9 @@ impl AppControl {
                 // it is possible that this `insert` evict local peer itself from the group
                 // later this will cause removing chunk when check membership, so no special treatment here
                 // same for the `insert` in handling QueryProofOk
-                chunk.insert(chunk_hash, public_key, joining_member, &self.config);
+                chunk.insert(&chunk_hash, public_key, joining_member, &self.config);
                 chunk.retain_alive(&self.config); // shrink high watermark if possible
-            } else if chunk.will_accept(chunk_hash, member.index, &member.id(), &self.config) {
+            } else if chunk.will_accept(&chunk_hash, member.index, &member.id(), &self.config) {
                 // this is also the path for receiving gossip from unseen peer
                 // because the gossip always include sender itself in the `members`
                 let peer_id = member.id();
@@ -609,7 +609,7 @@ impl AppControl {
         for (peer_id, peer_addr) in self
             .handle
             .query(
-                Self::fragment_hash(chunk_hash, index),
+                Self::fragment_hash(&chunk_hash, index),
                 self.config.invite_count,
             )
             .await
@@ -643,7 +643,7 @@ impl AppControl {
             return; // need merge?
         }
 
-        let Some(proof) = self.prove(chunk_hash, message.fragment_index) else {
+        let Some(proof) = self.prove(&chunk_hash, message.fragment_index) else {
             //
             return;
         };
@@ -671,7 +671,7 @@ impl AppControl {
         };
 
         let inserted = chunk.insert(
-            chunk_hash,
+            &chunk_hash,
             self.keypair.public(),
             Member {
                 index: chunk.fragment_index,
@@ -718,7 +718,7 @@ impl AppControl {
 
         let member = message.member.as_ref().unwrap();
         let public_key = member.public_key().unwrap();
-        if !self.verify(chunk_hash, member.index, &public_key, &member.proof) {
+        if !self.verify(&chunk_hash, member.index, &public_key, &member.proof) {
             //
             return;
         }
@@ -762,7 +762,7 @@ impl AppControl {
         };
 
         let public_key = member.public_key().unwrap();
-        if !self.verify(chunk_hash, member.index, &public_key, &member.proof) {
+        if !self.verify(&chunk_hash, member.index, &public_key, &member.proof) {
             //
             return;
         }
@@ -848,13 +848,13 @@ impl AppControl {
         }
         let member = message.member.as_ref().unwrap();
         let public_key = member.public_key().unwrap();
-        if !self.verify(chunk_hash, member.index, &public_key, &member.proof) {
+        if !self.verify(&chunk_hash, member.index, &public_key, &member.proof) {
             //
             return;
         }
         let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
         chunk.insert(
-            chunk_hash,
+            &chunk_hash,
             public_key,
             Member::new(member, true),
             &self.config,
@@ -863,13 +863,13 @@ impl AppControl {
     }
 
     // TODO homomorphic hashing
-    fn fragment_hash(chunk_hash: Multihash, index: u32) -> Multihash {
+    fn fragment_hash(chunk_hash: &Multihash, index: u32) -> Multihash {
         let mut input = chunk_hash.to_bytes();
         input.extend(&index.to_be_bytes());
         Code::Sha2_256.digest(&input)
     }
 
-    fn accept_probablity(chunk_hash: Multihash, index: u32, peer_id: &PeerId) -> f64 {
+    fn accept_probablity(chunk_hash: &Multihash, index: u32, peer_id: &PeerId) -> f64 {
         let fragment_hash = Self::fragment_hash(chunk_hash, index);
         let distance = kbucket::Key::from(fragment_hash).distance(&kbucket::Key::from(*peer_id));
         // TODO tune the probability distribution properly
@@ -880,7 +880,7 @@ impl AppControl {
         }
     }
 
-    fn accepted(chunk_hash: Multihash, index: u32, peer_id: &PeerId, proof: &[u8]) -> bool {
+    fn accepted(chunk_hash: &Multihash, index: u32, peer_id: &PeerId, proof: &[u8]) -> bool {
         let seed = {
             let mut hasher = Sha2_256::default();
             hasher.update(proof);
@@ -889,7 +889,7 @@ impl AppControl {
         StdRng::from_seed(seed).gen_bool(Self::accept_probablity(chunk_hash, index, peer_id))
     }
 
-    fn prove(&self, chunk_hash: Multihash, index: u32) -> Option<Vec<u8>> {
+    fn prove(&self, chunk_hash: &Multihash, index: u32) -> Option<Vec<u8>> {
         let proof = {
             let mut input = chunk_hash.to_bytes();
             input.extend(&index.to_be_bytes());
@@ -909,14 +909,14 @@ impl AppControl {
 
     fn verify(
         &self,
-        chunk_hash: Multihash,
+        chunk_hash: &Multihash,
         index: u32,
         public_key: &PublicKey,
         proof: &[u8],
     ) -> bool {
         let mut input = chunk_hash.to_bytes();
         input.extend(&index.to_be_bytes());
-        let chunk = &self.chunks[&chunk_hash];
+        let chunk = &self.chunks[chunk_hash];
         chunk.watermark(&self.config).contains(&index)
             && public_key.verify(&input, proof)
             && Self::accepted(
@@ -976,7 +976,7 @@ impl Chunk {
 
     fn will_accept(
         &self,
-        chunk_hash: Multihash,
+        chunk_hash: &Multihash,
         index: u32,
         peer_id: &PeerId,
         config: &AppConfig,
@@ -988,7 +988,7 @@ impl Chunk {
             return true;
         };
         let d = |peer_id: &PeerId| {
-            kbucket::Key::from(peer_id.to_bytes()).distance(&kbucket::Key::from(chunk_hash))
+            kbucket::Key::from(peer_id.to_bytes()).distance(&kbucket::Key::from(*chunk_hash))
         };
         // check member exist?
         d(peer_id) < d(&PeerId::from_public_key(member_key))
@@ -996,7 +996,7 @@ impl Chunk {
 
     fn insert(
         &mut self,
-        chunk_hash: Multihash,
+        chunk_hash: &Multihash,
         public_key: PublicKey,
         member: Member,
         config: &AppConfig,
