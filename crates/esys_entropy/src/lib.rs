@@ -44,13 +44,13 @@ use tracing::{
 };
 
 #[derive(NetworkBehavior)]
-pub struct App {
+pub struct Base {
     identify: Identify,
     kad: Kademlia<MemoryStore>,
     rpc: behavior::Behavior,
 }
 
-impl App {
+impl Base {
     fn rpc_ensure_address(&mut self, peer_id: &PeerId, addr: Multiaddr) {
         // silly way to prevent repeated address for a peer to cause problems
         self.rpc.remove_address(peer_id, &addr);
@@ -59,21 +59,21 @@ impl App {
 }
 
 #[derive(Clone)]
-pub struct AppHandle {
+pub struct BaseHandle {
     ingress: mpsc::UnboundedSender<IngressTask>,
 }
 
-type IngressTask = Box<dyn FnOnce(&mut Swarm<App>, &mut Vec<AppObserver>) + Send>;
+type IngressTask = Box<dyn FnOnce(&mut Swarm<Base>, &mut Vec<AppObserver>) + Send>;
 pub type AppObserver =
-    Box<dyn FnMut(&mut Option<ObserverEvent>, &mut Swarm<App>) -> ControlFlow<()> + Send>;
-pub type ObserverEvent = SwarmEvent<AppEvent, HandlerErr<App>>;
+    Box<dyn FnMut(&mut Option<ObserverEvent>, &mut Swarm<Base>) -> ControlFlow<()> + Send>;
+pub type ObserverEvent = SwarmEvent<BaseEvent, HandlerErr<Base>>;
 
-impl App {
+impl Base {
     pub fn run(
         name: impl ToString,
         transport: transport::Boxed<(PeerId, StreamMuxerBox)>,
-        keypair: Keypair,
-    ) -> (JoinHandle<Swarm<Self>>, AppHandle) {
+        keypair: &Keypair,
+    ) -> (JoinHandle<Swarm<Self>>, BaseHandle) {
         let id = PeerId::from_public_key(&keypair.public());
         let app = Self {
             identify: Identify::new(identify::Config::new(
@@ -89,7 +89,7 @@ impl App {
         };
         let mut swarm = SwarmBuilder::with_tokio_executor(transport, app, id).build();
         let mut ingress = mpsc::unbounded_channel();
-        let handle = AppHandle { ingress: ingress.0 };
+        let handle = BaseHandle { ingress: ingress.0 };
         let name = name.to_string();
         let event_loop = spawn(async move {
             tracing::trace!("launch app event looop");
@@ -118,8 +118,8 @@ impl App {
     }
 }
 
-impl AppHandle {
-    pub fn ingress(&self, action: impl FnOnce(&mut Swarm<App>) + Send + Sync + 'static) {
+impl BaseHandle {
+    pub fn ingress(&self, action: impl FnOnce(&mut Swarm<Base>) + Send + Sync + 'static) {
         self.ingress
             .send(Box::new(|swarm, _| action(swarm)))
             .map_err(|_| ())
@@ -128,7 +128,7 @@ impl AppHandle {
 
     pub fn ingress_wait<T: Send + 'static>(
         &self,
-        action: impl FnOnce(&mut Swarm<App>) -> T + Send + Sync + 'static,
+        action: impl FnOnce(&mut Swarm<Base>) -> T + Send + Sync + 'static,
     ) -> impl Future<Output = T> + Send + 'static {
         let result = oneshot::channel();
         self.ingress(move |swarm| {
@@ -143,7 +143,7 @@ impl AppHandle {
 
     pub fn subscribe<T: Send + 'static>(
         &self,
-        mut observer: impl FnMut(&mut Option<ObserverEvent>, &mut Swarm<App>) -> ControlFlow<T>
+        mut observer: impl FnMut(&mut Option<ObserverEvent>, &mut Swarm<Base>) -> ControlFlow<T>
             + Send
             + 'static,
     ) -> impl Future<Output = T> + Send + 'static {
@@ -194,7 +194,7 @@ impl AppHandle {
 
     pub fn serve_kad_add_address(&self) {
         let s = self.subscribe(|event, swarm| {
-            if let Behavior(AppEvent::Identify(identify::Event::Received { peer_id, info })) =
+            if let Behavior(BaseEvent::Identify(identify::Event::Received { peer_id, info })) =
                 event.as_ref().unwrap()
             {
                 swarm.behaviour_mut().kad.add_address(
@@ -230,7 +230,7 @@ impl AppHandle {
                 ControlFlow::Continue(())
             }
             // assert this happens after the one above
-            Behavior(AppEvent::Identify(identify::Event::Received { peer_id, .. }))
+            Behavior(BaseEvent::Identify(identify::Event::Received { peer_id, .. }))
                 if Some(*peer_id) == service_id =>
             {
                 ControlFlow::Break(())
@@ -244,7 +244,7 @@ impl AppHandle {
             swarm.behaviour_mut().kad.bootstrap().unwrap();
         });
         self.subscribe(move |event, _| {
-            if let Behavior(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
+            if let Behavior(BaseEvent::Kad(KademliaEvent::OutboundQueryProgressed {
                 result: QueryResult::Bootstrap(result),
                 step,
                 ..
@@ -296,7 +296,7 @@ impl AppHandle {
             .instrument(span.clone())
             .await;
         self.subscribe(move |event, _| match event.as_ref().unwrap() {
-            Behavior(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
+            Behavior(BaseEvent::Kad(KademliaEvent::OutboundQueryProgressed {
                 id,
                 result: QueryResult::PutRecord(result),
                 ..
@@ -323,7 +323,7 @@ impl AppHandle {
             .await;
         // tracing::debug!(%peer_id, ?get_id);
         self.subscribe(move |event, swarm| match event.take().unwrap() {
-            Behavior(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
+            Behavior(BaseEvent::Kad(KademliaEvent::OutboundQueryProgressed {
                 id,
                 result: QueryResult::GetRecord(result),
                 ..
@@ -355,7 +355,7 @@ impl AppHandle {
             .await;
         let peers = self
             .subscribe(move |event, swarm| match event.take().unwrap() {
-                Behavior(AppEvent::Kad(KademliaEvent::OutboundQueryProgressed {
+                Behavior(BaseEvent::Kad(KademliaEvent::OutboundQueryProgressed {
                     id,
                     result: QueryResult::GetClosestPeers(result),
                     ..
@@ -411,11 +411,11 @@ fn is_global(addr: &Multiaddr) -> bool {
     }
 }
 
-pub struct AppControl {
-    handle: AppHandle,
+pub struct App {
+    base: BaseHandle,
     control: (
-        mpsc::UnboundedSender<ControlEvent>,
-        mpsc::UnboundedReceiver<ControlEvent>,
+        mpsc::UnboundedSender<AppEvent>,
+        mpsc::UnboundedReceiver<AppEvent>,
     ),
     keypair: Keypair,
     addr: Multiaddr,
@@ -465,7 +465,7 @@ enum Fragment {
 }
 
 #[derive(Debug)]
-enum ControlEvent {
+enum AppEvent {
     // Close,
     Rpc(<behavior::Behavior as NetworkBehavior>::OutEvent),
     Gossip(Multihash),
@@ -474,10 +474,10 @@ enum ControlEvent {
     // client request
 }
 
-impl AppControl {
-    pub fn new(handle: AppHandle, keypair: Keypair, addr: Multiaddr, config: AppConfig) -> Self {
+impl App {
+    pub fn new(base: BaseHandle, keypair: Keypair, addr: Multiaddr, config: AppConfig) -> Self {
         Self {
-            handle,
+            base,
             control: mpsc::unbounded_channel(),
             chunks: Default::default(),
             addr,
@@ -488,10 +488,10 @@ impl AppControl {
 
     pub async fn serve(&mut self) {
         let control = self.control.0.clone();
-        let s = self.handle.subscribe(move |event, _| {
+        let s = self.base.subscribe(move |event, _| {
             match event.take().unwrap() {
-                Behavior(AppEvent::Rpc(event)) => {
-                    if control.send(ControlEvent::Rpc(event)).is_err() {
+                Behavior(BaseEvent::Rpc(event)) => {
+                    if control.send(AppEvent::Rpc(event)).is_err() {
                         return ControlFlow::Break(());
                     }
                 }
@@ -507,10 +507,10 @@ impl AppControl {
             use proto::{request::Inner::*, response::Inner::*};
             match event {
                 // ControlEvent::Close => break,
-                ControlEvent::Gossip(chunk_hash) => self.gossip(&chunk_hash),
-                ControlEvent::Membership(chunk_hash) => self.check_membership(&chunk_hash).await,
-                ControlEvent::Invite(chunk_hash) => self.invite(&chunk_hash).await,
-                ControlEvent::Rpc(libp2p::request_response::Event::Message {
+                AppEvent::Gossip(chunk_hash) => self.gossip(&chunk_hash),
+                AppEvent::Membership(chunk_hash) => self.check_membership(&chunk_hash).await,
+                AppEvent::Invite(chunk_hash) => self.invite(&chunk_hash).await,
+                AppEvent::Rpc(libp2p::request_response::Event::Message {
                     message:
                         Message::Request {
                             request, channel, ..
@@ -522,19 +522,19 @@ impl AppControl {
                     QueryFragment(message) => self.handle_query_fragment(&message, channel),
                     QueryProof(message) => self.handle_query_proof(&message, channel),
                 },
-                ControlEvent::Rpc(libp2p::request_response::Event::Message {
+                AppEvent::Rpc(libp2p::request_response::Event::Message {
                     message: Message::Response { response, .. },
                     ..
                 }) => match response.inner.unwrap() {
                     QueryFragmentOk(message) => self.handle_query_fragment_ok(&message),
                     QueryProofOk(message) => self.handle_query_proof_ok(&message),
                 },
-                ControlEvent::Rpc(_) => {} // do anything?
+                AppEvent::Rpc(_) => {} // do anything?
             }
         }
     }
 
-    fn set_timer(&self, duration: Duration, event: ControlEvent) {
+    fn set_timer(&self, duration: Duration, event: AppEvent) {
         let control = self.control.0.clone();
         spawn(async move {
             sleep(duration).await;
@@ -577,7 +577,7 @@ impl AppControl {
         self.invite(chunk_hash).await;
         self.set_timer(
             self.config.membership_interval,
-            ControlEvent::Membership(*chunk_hash),
+            AppEvent::Membership(*chunk_hash),
         );
     }
 
@@ -598,10 +598,7 @@ impl AppControl {
         for index in invite_indexes {
             self.invite_index(chunk_hash, index).await;
         }
-        self.set_timer(
-            self.config.invite_interval,
-            ControlEvent::Invite(*chunk_hash),
-        );
+        self.set_timer(self.config.invite_interval, AppEvent::Invite(*chunk_hash));
     }
 
     fn gossip(&self, chunk_hash: &Multihash) {
@@ -630,17 +627,14 @@ impl AppControl {
             }
             let peer_addr = member.addr.clone();
             let request = request.clone();
-            self.handle.ingress(move |swarm| {
+            self.base.ingress(move |swarm| {
                 swarm
                     .behaviour_mut()
                     .rpc_ensure_address(&peer_id, peer_addr);
                 swarm.behaviour_mut().rpc.send_request(&peer_id, request);
             });
         }
-        self.set_timer(
-            self.config.gossip_interval,
-            ControlEvent::Gossip(*chunk_hash),
-        );
+        self.set_timer(self.config.gossip_interval, AppEvent::Gossip(*chunk_hash));
     }
 
     fn handle_gossip(&mut self, message: &proto::Gossip) {
@@ -674,7 +668,7 @@ impl AppControl {
                 let request = proto::Request::from(proto::QueryProof {
                     chunk_hash: message.chunk_hash.clone(),
                 });
-                self.handle.ingress(move |swarm| {
+                self.base.ingress(move |swarm| {
                     swarm.behaviour_mut().rpc_ensure_address(&peer_id, addr);
                     swarm.behaviour_mut().rpc.send_request(&peer_id, request);
                 });
@@ -704,7 +698,7 @@ impl AppControl {
                 .collect(),
         });
         for (peer_id, peer_addr) in self
-            .handle
+            .base
             .query(
                 Self::fragment_hash(chunk_hash, index),
                 self.config.invite_count,
@@ -725,7 +719,7 @@ impl AppControl {
                 continue;
             };
             let request = request.clone();
-            self.handle.ingress(move |swarm| {
+            self.base.ingress(move |swarm| {
                 swarm
                     .behaviour_mut()
                     .rpc_ensure_address(&peer_id, peer_addr);
@@ -795,7 +789,7 @@ impl AppControl {
             let peer_id = member.id();
             let addr = member.addr();
             let request = request.clone();
-            self.handle.ingress(move |swarm| {
+            self.base.ingress(move |swarm| {
                 swarm.behaviour_mut().rpc_ensure_address(&peer_id, addr);
                 swarm.behaviour_mut().rpc.send_request(&peer_id, request);
             });
@@ -841,7 +835,7 @@ impl AppControl {
                     .clone(),
             )),
         });
-        self.handle.ingress(move |swarm| {
+        self.base.ingress(move |swarm| {
             swarm
                 .behaviour_mut()
                 .rpc
@@ -908,7 +902,7 @@ impl AppControl {
         self.set_timer(
             self.config.membership_interval
                 + thread_rng().gen_range(Duration::ZERO..self.config.membership_interval),
-            ControlEvent::Membership(chunk_hash),
+            AppEvent::Membership(chunk_hash),
         );
     }
 
@@ -933,7 +927,7 @@ impl AppControl {
                     .clone(),
             )),
         });
-        self.handle.ingress(move |swarm| {
+        self.base.ingress(move |swarm| {
             swarm
                 .behaviour_mut()
                 .rpc

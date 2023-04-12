@@ -1,7 +1,7 @@
 use std::{mem::take, net::Ipv4Addr, time::Duration};
 
 use clap::Parser;
-use esys_entropy::{App, AppConfig, AppControl, AppHandle};
+use esys_entropy::{App, AppConfig, Base, BaseHandle};
 use libp2p::{
     core::upgrade::Version::V1,
     identity::Keypair,
@@ -29,42 +29,42 @@ async fn main() {
     let cli = Cli::parse();
 
     if cli.bootstrap_service {
-        let app = start_app(&cli).await;
-        // handle.await.unwrap();
+        let app = start_base(&cli).await;
         ctrl_c().await.unwrap();
         drop(app.handle);
         app.event_loop.await.unwrap();
     } else {
         let mut tasks = Vec::new();
         for _ in 0..cli.n {
-            let app = start_app(&cli).await;
+            let base = start_base(&cli).await;
             let task = spawn(async move {
                 let delay = thread_rng().gen_range(0..5 * 1000);
                 sleep(Duration::from_millis(delay)).await;
-                app.handle
+                base.handle
                     .boostrap(multiaddr!(Ip4(cli.service_ip.unwrap()), Tcp(8500u16)))
                     .await;
-                sleep(Duration::from_millis(5000)).await;
-                app.handle.register().await;
-                app
+                sleep(Duration::from_millis(5 * 1000)).await;
+                base.handle.register().await;
+                base
             });
             tasks.push(task);
         }
 
-        let mut apps = Vec::new();
+        let mut bases = Vec::new();
         for task in tasks {
-            apps.push(task.await.unwrap());
+            bases.push(task.await.unwrap());
         }
         tracing::info!("peers register done");
 
-        let mut event_loops = Vec::new();
-        for app in apps {
-            event_loops.push(app.event_loop);
-            spawn(async move {
-                let mut control = AppControl::new(
-                    app.handle,
-                    app.keypair,
-                    app.addr,
+        let mut base_loops = Vec::new();
+        let mut app_loops = Vec::new();
+        for base in bases {
+            base_loops.push(base.event_loop);
+            let app_loop = spawn(async move {
+                let mut app = App::new(
+                    base.handle,
+                    base.keypair,
+                    base.addr,
                     AppConfig {
                         invite_count: 0,
                         fragment_k: 0,
@@ -76,32 +76,33 @@ async fn main() {
                         invite_interval: Duration::ZERO,
                     },
                 );
-                control.serve().await;
+                app.serve().await;
             });
+            app_loops.push(app_loop);
         }
 
         ctrl_c().await.unwrap();
-        for event_loop in event_loops {
+        for event_loop in base_loops {
             event_loop.await.unwrap();
         }
     }
 }
 
-struct StartApp {
-    event_loop: JoinHandle<Swarm<App>>,
-    handle: AppHandle,
+struct StartBase {
+    event_loop: JoinHandle<Swarm<Base>>,
+    handle: BaseHandle,
     keypair: Keypair,
     addr: Multiaddr,
 }
 
-async fn start_app(cli: &Cli) -> StartApp {
+async fn start_base(cli: &Cli) -> StartBase {
     let id_keys = Keypair::generate_ed25519();
     let transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
         .upgrade(V1)
         .authenticate(libp2p::noise::NoiseAuthenticated::xx(&id_keys).unwrap())
         .multiplex(libp2p::yamux::YamuxConfig::default())
         .boxed();
-    let (event_loop, handle) = App::run("", transport, id_keys.clone());
+    let (event_loop, handle) = Base::run("", transport, &id_keys);
     let mut first_addr = true;
     let ip = cli.ip;
     handle.serve_add_external_address(move |addr| {
@@ -122,7 +123,7 @@ async fn start_app(cli: &Cli) -> StartApp {
     let addr = handle
         .ingress_wait(|swarm| swarm.external_addresses().next().unwrap().addr.clone())
         .await;
-    StartApp {
+    StartBase {
         event_loop,
         handle,
         keypair: id_keys,

@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use esys_entropy::App;
+use esys_entropy::Base;
 use libp2p::{
     core::{transport::MemoryTransport, upgrade::Version::V1},
     identity::Keypair,
@@ -30,7 +30,7 @@ async fn main() {
         .authenticate(NoiseAuthenticated::xx(&server_keypair).unwrap())
         .multiplex(YamuxConfig::default())
         .boxed();
-    let (_handle, server_control) = App::run("bootstrap", transport, server_keypair);
+    let (_handle, server_control) = Base::run("bootstrap", transport, &server_keypair);
     server_control.serve_add_external_address(|addr| Some(addr.clone()));
     server_control.serve_kad_add_address();
     server_control.listen_on("/memory/1".parse().unwrap());
@@ -52,7 +52,7 @@ async fn main() {
                     .authenticate(NoiseAuthenticated::xx(&key_pair).unwrap())
                     .multiplex(YamuxConfig::default())
                     .boxed();
-                let (_handle, control) = App::run(format!("client-{i}"), transport, key_pair);
+                let (_handle, control) = Base::run(format!("client-{i}"), transport, &key_pair);
                 control.serve_add_external_address(|addr| Some(addr.clone()));
                 control.serve_kad_add_address();
                 control.listen_on("/memory/0".parse().unwrap());
