@@ -5,7 +5,7 @@ use std::{
     future::Future,
     mem::{replace, take},
     ops::{ControlFlow, RangeInclusive},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -33,7 +33,7 @@ use libp2p::{
 use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
 use tokio::{
     select, spawn,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, Notify},
     task::JoinHandle,
     time::sleep,
 };
@@ -178,18 +178,24 @@ impl BaseHandle {
     pub fn serve_add_external_address(
         &self,
         mut into_external: impl FnMut(&Multiaddr) -> Option<Multiaddr> + Send + 'static,
-    ) {
-        let s = self.subscribe(move |event, swarm| {
-            if let SwarmEvent::NewListenAddr { address, .. } = event.as_ref().unwrap() {
-                if let Some(address) = into_external(address) {
-                    tracing::info!(peer_id = %swarm.local_peer_id(), %address, "add external");
-                    swarm.add_external_address(address, AddressScore::Infinite);
+    ) -> Arc<Notify> {
+        let notify = Arc::new(Notify::new());
+        let s = self.subscribe({
+            let notify = notify.clone();
+            move |event, swarm| {
+                if let SwarmEvent::NewListenAddr { address, .. } = event.as_ref().unwrap() {
+                    if let Some(address) = into_external(address) {
+                        tracing::info!(peer_id = %swarm.local_peer_id(), %address, "add external");
+                        swarm.add_external_address(address, AddressScore::Infinite);
+                        notify.notify_one();
+                    }
+                    *event = None;
                 }
-                *event = None;
+                ControlFlow::<()>::Continue(())
             }
-            ControlFlow::<()>::Continue(())
         });
         drop(s);
+        notify
     }
 
     pub fn serve_kad_add_address(&self) {
@@ -424,6 +430,8 @@ pub struct App {
     config: AppConfig,
 }
 
+pub struct AppControl(mpsc::UnboundedSender<AppEvent>);
+
 pub struct AppConfig {
     pub invite_count: usize,
     pub fragment_k: usize,
@@ -466,12 +474,20 @@ enum Fragment {
 
 #[derive(Debug)]
 enum AppEvent {
-    // Close,
+    Close,
     Rpc(<behavior::Behavior as NetworkBehavior>::OutEvent),
     Gossip(Multihash),
     Membership(Multihash),
     Invite(Multihash),
     // client request
+}
+
+impl AppControl {
+    pub fn close(&self) {
+        self.0.send(AppEvent::Close).unwrap();
+    }
+
+    // request
 }
 
 impl App {
@@ -484,6 +500,10 @@ impl App {
             keypair,
             config,
         }
+    }
+
+    pub fn control(&self) -> AppControl {
+        AppControl(self.control.0.clone())
     }
 
     pub async fn serve(&mut self) {
@@ -506,7 +526,7 @@ impl App {
         while let Some(event) = self.control.1.recv().await {
             use proto::{request::Inner::*, response::Inner::*};
             match event {
-                // ControlEvent::Close => break,
+                AppEvent::Close => break,
                 AppEvent::Gossip(chunk_hash) => self.gossip(&chunk_hash),
                 AppEvent::Membership(chunk_hash) => self.check_membership(&chunk_hash).await,
                 AppEvent::Invite(chunk_hash) => self.invite(&chunk_hash).await,

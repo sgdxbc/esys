@@ -31,5 +31,7 @@
   tasks:
   - ansible.builtin.shell: >
       tmux new-session -d -s esys 
-      ./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }}
+      ./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 10
       || read _
+    environment:
+      RUST_LOG: esys_entropy=debug

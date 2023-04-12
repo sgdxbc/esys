@@ -1,4 +1,4 @@
-use std::{mem::take, net::Ipv4Addr, time::Duration};
+use std::{mem::take, net::Ipv4Addr, pin::pin, time::Duration};
 
 use clap::Parser;
 use esys_entropy::{App, AppConfig, Base, BaseHandle};
@@ -10,6 +10,8 @@ use libp2p::{
 };
 use rand::{thread_rng, Rng};
 use tokio::{signal::ctrl_c, spawn, task::JoinHandle, time::sleep};
+use tracing::{debug_span, Instrument};
+use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 #[derive(Parser)]
 struct Cli {
@@ -25,7 +27,10 @@ struct Cli {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+        .init();
     let cli = Cli::parse();
 
     if cli.bootstrap_service {
@@ -39,11 +44,16 @@ async fn main() {
             let base = start_base(&cli).await;
             let task = spawn(async move {
                 let delay = thread_rng().gen_range(0..5 * 1000);
+                // up to 5s random delay + up to 10s bootstrap latency + safe margin + still want random delay
+                let register_delay = pin!(sleep(Duration::from_millis(20 * 1000 + delay)));
+
                 sleep(Duration::from_millis(delay)).await;
                 base.handle
                     .boostrap(multiaddr!(Ip4(cli.service_ip.unwrap()), Tcp(8500u16)))
+                    .instrument(debug_span!("bootstrap", addr = %base.addr))
                     .await;
-                sleep(Duration::from_millis(5 * 1000)).await;
+
+                register_delay.await;
                 base.handle.register().await;
                 base
             });
@@ -57,31 +67,37 @@ async fn main() {
         tracing::info!("peers register done");
 
         let mut base_loops = Vec::new();
+        let mut app_controls = Vec::new();
         let mut app_loops = Vec::new();
         for base in bases {
             base_loops.push(base.event_loop);
-            let app_loop = spawn(async move {
-                let mut app = App::new(
-                    base.handle,
-                    base.keypair,
-                    base.addr,
-                    AppConfig {
-                        invite_count: 0,
-                        fragment_k: 0,
-                        fragment_n: 0,
-                        fragment_size: 0,
-                        watermark_interval: Duration::ZERO,
-                        membership_interval: Duration::ZERO,
-                        gossip_interval: Duration::ZERO,
-                        invite_interval: Duration::ZERO,
-                    },
-                );
-                app.serve().await;
-            });
+            let mut app = App::new(
+                base.handle,
+                base.keypair,
+                base.addr,
+                AppConfig {
+                    invite_count: 0,
+                    fragment_k: 0,
+                    fragment_n: 0,
+                    fragment_size: 0,
+                    watermark_interval: Duration::ZERO,
+                    membership_interval: Duration::ZERO,
+                    gossip_interval: Duration::ZERO,
+                    invite_interval: Duration::ZERO,
+                },
+            );
+            app_controls.push(app.control());
+            let app_loop = spawn(async move { app.serve().await });
             app_loops.push(app_loop);
         }
 
         ctrl_c().await.unwrap();
+        for app_control in app_controls {
+            app_control.close();
+        }
+        for app_loop in app_loops {
+            app_loop.await.unwrap();
+        }
         for event_loop in base_loops {
             event_loop.await.unwrap();
         }
@@ -105,7 +121,7 @@ async fn start_base(cli: &Cli) -> StartBase {
     let (event_loop, handle) = Base::run("", transport, &id_keys);
     let mut first_addr = true;
     let ip = cli.ip;
-    handle.serve_add_external_address(move |addr| {
+    let notify = handle.serve_add_external_address(move |addr| {
         addr.replace(0, |protocol| {
             assert!(matches!(protocol, Protocol::Ip4(_)));
             if take(&mut first_addr) {
@@ -120,6 +136,7 @@ async fn start_base(cli: &Cli) -> StartBase {
         Ip4(0),
         Tcp(if cli.bootstrap_service { 8500u16 } else { 0 })
     ));
+    notify.notified().await;
     let addr = handle
         .ingress_wait(|swarm| swarm.external_addresses().next().unwrap().addr.clone())
         .await;
