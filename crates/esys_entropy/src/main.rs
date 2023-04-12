@@ -77,6 +77,8 @@ async fn main() {
                 base.addr,
                 AppConfig {
                     invite_count: 0,
+                    chunk_k: 0,
+                    chunk_n: 0,
                     fragment_k: 0,
                     fragment_n: 0,
                     fragment_size: 0,

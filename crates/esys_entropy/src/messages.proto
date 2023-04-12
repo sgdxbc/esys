@@ -25,7 +25,7 @@ message Invite {
     uint32 fragment_index = 2; // of receiver
     // TODO critical metadata should be securely protected by e.g. client signature
     uint64 enter_time_sec = 3;
-    repeated Member members = 4;
+    repeated Member members = 4; // client itself as single member in put request, no proof
 }
 
 message QueryFragment {
@@ -37,6 +37,7 @@ message QueryFragmentOk {
     bytes chunk_hash = 1;
     Member member = 2; // of sender
     bytes fragment = 3;
+    repeated Member init_members = 4; // only on client request
 }
 
 message QueryProof {

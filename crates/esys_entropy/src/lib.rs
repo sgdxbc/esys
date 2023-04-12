@@ -10,7 +10,7 @@ use std::{
 };
 
 use behavior::proto;
-use esys_wirehair::WirehairDecoder;
+use esys_wirehair::{WirehairDecoder, WirehairEncoder};
 use libp2p::{
     core::{muxing::StreamMuxerBox, transport, ConnectedPoint},
     futures::StreamExt,
@@ -30,7 +30,7 @@ use libp2p::{
     },
     Multiaddr, PeerId, Swarm,
 };
-use rand::{rngs::StdRng, thread_rng, Rng, SeedableRng};
+use rand::{random, rngs::StdRng, thread_rng, Rng, SeedableRng};
 use tokio::{
     select, spawn,
     sync::{mpsc, oneshot, Notify},
@@ -426,6 +426,7 @@ pub struct App {
     keypair: Keypair,
     addr: Multiaddr,
     chunks: HashMap<Multihash, Chunk>,
+    client_chunks: HashMap<Multihash, ClientChunk>,
 
     config: AppConfig,
 }
@@ -434,6 +435,8 @@ pub struct AppControl(mpsc::UnboundedSender<AppEvent>);
 
 pub struct AppConfig {
     pub invite_count: usize,
+    pub chunk_k: usize,
+    pub chunk_n: usize,
     pub fragment_k: usize,
     pub fragment_n: usize,
     pub fragment_size: usize,
@@ -472,13 +475,24 @@ enum Fragment {
     Complete(Vec<u8>),
 }
 
+struct ClientChunk {
+    encoder: Mutex<WirehairEncoder>,
+    enter_time_sec: u64,
+    index: u32,
+    members: HashMap<PeerId, (Member, ResponseChannel<proto::Response>)>,
+    indexes: BTreeMap<u32, PublicKey>,
+}
+
 #[derive(Debug)]
 enum AppEvent {
     Close,
+
     Rpc(<behavior::Behavior as NetworkBehavior>::OutEvent),
     Gossip(Multihash),
     Membership(Multihash),
     Invite(Multihash),
+
+    ClientInvite,
     // client request
 }
 
@@ -496,6 +510,7 @@ impl App {
             base,
             control: mpsc::unbounded_channel(),
             chunks: Default::default(),
+            client_chunks: Default::default(),
             addr,
             keypair,
             config,
@@ -527,9 +542,11 @@ impl App {
             use proto::{request::Inner::*, response::Inner::*};
             match event {
                 AppEvent::Close => break,
+
                 AppEvent::Gossip(chunk_hash) => self.gossip(&chunk_hash),
-                AppEvent::Membership(chunk_hash) => self.check_membership(&chunk_hash).await,
-                AppEvent::Invite(chunk_hash) => self.invite(&chunk_hash).await,
+                AppEvent::Membership(chunk_hash) => self.check_membership(&chunk_hash),
+                AppEvent::Invite(chunk_hash) => self.invite(&chunk_hash),
+
                 AppEvent::Rpc(libp2p::request_response::Event::Message {
                     message:
                         Message::Request {
@@ -550,6 +567,8 @@ impl App {
                     QueryProofOk(message) => self.handle_query_proof_ok(&message),
                 },
                 AppEvent::Rpc(_) => {} // do anything?
+
+                AppEvent::ClientInvite => self.client_invite(),
             }
         }
     }
@@ -560,6 +579,114 @@ impl App {
             sleep(duration).await;
             let _ = control.send(event); // could fail if outlive event loop
         });
+    }
+
+    fn put(&mut self, data: &[u8]) {
+        assert!(self.client_chunks.is_empty());
+        assert_eq!(
+            data.len(),
+            self.config.fragment_size * self.config.fragment_k * self.config.chunk_k
+        );
+        let mut outer_encoder = WirehairEncoder::new(
+            data,
+            (self.config.fragment_size * self.config.fragment_k) as _,
+        );
+        let mut buffer = vec![0; self.config.fragment_size * self.config.fragment_k];
+        for _ in 0..self.config.chunk_n {
+            outer_encoder.encode(random(), &mut buffer).unwrap();
+            let chunk_hash = Code::Sha2_256.digest(&buffer);
+            let chunk = ClientChunk {
+                encoder: Mutex::new(WirehairEncoder::new(
+                    &buffer,
+                    self.config.fragment_size as _,
+                )),
+                enter_time_sec: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+                index: 0,
+                members: Default::default(),
+                indexes: Default::default(),
+            };
+            self.client_chunks.insert(chunk_hash, chunk);
+        }
+        self.client_invite();
+    }
+
+    fn client_invite(&mut self) {
+        for (chunk_hash, chunk) in &mut self.client_chunks {
+            if chunk.indexes.len() >= self.config.fragment_n {
+                continue;
+            }
+            chunk.index += (self.config.fragment_n - chunk.indexes.len()) as u32;
+            for index in 0..chunk.index {
+                if chunk.indexes.contains_key(&index) {
+                    continue;
+                }
+                let request = proto::Request::from(proto::Invite {
+                    chunk_hash: chunk_hash.to_bytes(),
+                    fragment_index: index,
+                    enter_time_sec: chunk.enter_time_sec,
+                    members: vec![proto::Member::new(
+                        u32::MAX,
+                        &self.keypair.public(),
+                        &self.addr,
+                        Default::default(),
+                    )],
+                });
+                spawn(Self::invite_index_task(
+                    *chunk_hash,
+                    index,
+                    self.base.clone(),
+                    self.config.invite_count,
+                    request,
+                ));
+            }
+        }
+
+        self.set_timer(self.config.invite_interval, AppEvent::ClientInvite);
+    }
+
+    fn client_handle_query_fragment(
+        &mut self,
+        message: &proto::QueryFragment,
+        channel: ResponseChannel<proto::Response>,
+    ) {
+        let chunk_hash = message.chunk_hash();
+        let member = message.member.as_ref().unwrap();
+        let public_key = member.public_key().unwrap();
+        if !self.verify(&chunk_hash, member.index, &public_key, &member.proof) {
+            //
+            return;
+        }
+
+        let chunk = self.client_chunks.get_mut(&chunk_hash).unwrap();
+        let member_id = PeerId::from_public_key(&public_key);
+        // check duplicated index / member
+        // a little bit duplicated with the last part of this file but i don't care any more
+        if chunk.members.contains_key(&member_id) {
+            //
+            return;
+        }
+        if let Some(prev_key) = chunk.indexes.get(&member.index) {
+            let d = |peer_id: &PeerId| {
+                kbucket::Key::from(peer_id.to_bytes()).distance(&kbucket::Key::from(chunk_hash))
+            };
+            let prev_id = PeerId::from_public_key(prev_key);
+            if d(&prev_id) <= d(&member_id) {
+                //
+                return;
+            }
+            chunk.members.remove(&prev_id);
+        }
+        chunk.indexes.insert(member.index, public_key);
+        chunk
+            .members
+            .insert(member_id, (Member::new(member, false), channel));
+
+        if chunk.indexes.len() >= self.config.fragment_n {
+            todo!()
+        }
     }
 
     // entropy message flow
@@ -582,7 +709,7 @@ impl App {
     // 4. (after all INVITE done) reset <highest taken fragment index> to the `group_size`th lowest taken fragment index
     // (above low watermark)
 
-    async fn check_membership(&mut self, chunk_hash: &Multihash) {
+    fn check_membership(&mut self, chunk_hash: &Multihash) {
         let chunk = self.chunks.get_mut(chunk_hash).unwrap();
         chunk.retain_alive(&self.config);
         if !chunk
@@ -594,14 +721,14 @@ impl App {
         }
 
         assert!(chunk.fragment_count() >= self.config.fragment_k);
-        self.invite(chunk_hash).await;
+        self.invite(chunk_hash);
         self.set_timer(
             self.config.membership_interval,
             AppEvent::Membership(*chunk_hash),
         );
     }
 
-    async fn invite(&mut self, chunk_hash: &Multihash) {
+    fn invite(&mut self, chunk_hash: &Multihash) {
         let chunk = self.chunks.get_mut(chunk_hash).unwrap();
         // can it get larger then n?
         if chunk.fragment_count() >= self.config.fragment_n {
@@ -616,7 +743,7 @@ impl App {
                 .filter(|index| !chunk.indexes.contains_key(index)),
         );
         for index in invite_indexes {
-            self.invite_index(chunk_hash, index).await;
+            self.invite_index(chunk_hash, index);
         }
         self.set_timer(self.config.invite_interval, AppEvent::Invite(*chunk_hash));
     }
@@ -696,7 +823,7 @@ impl App {
         }
     }
 
-    async fn invite_index(&self, chunk_hash: &Multihash, index: u32) {
+    fn invite_index(&self, chunk_hash: &Multihash, index: u32) {
         let chunk = &self.chunks[chunk_hash];
         assert!(!chunk.indexes.contains_key(&index));
         assert!(chunk.watermark(&self.config).contains(&index));
@@ -717,12 +844,24 @@ impl App {
                 })
                 .collect(),
         });
-        for (peer_id, peer_addr) in self
-            .base
-            .query(
-                Self::fragment_hash(chunk_hash, index),
-                self.config.invite_count,
-            )
+        spawn(Self::invite_index_task(
+            *chunk_hash,
+            index,
+            self.base.clone(),
+            self.config.invite_count,
+            request,
+        ));
+    }
+
+    async fn invite_index_task(
+        chunk_hash: Multihash,
+        index: u32,
+        base: BaseHandle,
+        invite_count: usize,
+        request: proto::Request,
+    ) {
+        for (peer_id, peer_addr) in base
+            .query(Self::fragment_hash(&chunk_hash, index), invite_count)
             .await
         {
             // if chunk.members.contains_key(&peer_id) {
@@ -739,7 +878,7 @@ impl App {
                 continue;
             };
             let request = request.clone();
-            self.base.ingress(move |swarm| {
+            base.ingress(move |swarm| {
                 swarm
                     .behaviour_mut()
                     .rpc_ensure_address(&peer_id, peer_addr);
@@ -822,6 +961,9 @@ impl App {
         channel: ResponseChannel<proto::Response>,
     ) {
         let chunk_hash = message.chunk_hash();
+        if self.client_chunks.contains_key(&chunk_hash) {
+            return self.client_handle_query_fragment(message, channel);
+        }
         if !self.chunks.contains_key(&chunk_hash) {
             //
             return;
@@ -854,6 +996,7 @@ impl App {
                     .proof
                     .clone(),
             )),
+            init_members: Default::default(), // not used
         });
         self.base.ingress(move |swarm| {
             swarm
