@@ -30,7 +30,7 @@ use libp2p::{
     },
     Multiaddr, PeerId, Swarm,
 };
-use rand::{random, rngs::StdRng, thread_rng, Rng, SeedableRng};
+use rand::{random, rngs::StdRng, thread_rng, Rng, RngCore, SeedableRng};
 use tokio::{
     select, spawn,
     sync::{mpsc, oneshot, Notify},
@@ -423,10 +423,14 @@ pub struct App {
         mpsc::UnboundedSender<AppEvent>,
         mpsc::UnboundedReceiver<AppEvent>,
     ),
+
     keypair: Keypair,
     addr: Multiaddr,
+
     chunks: HashMap<Multihash, Chunk>,
+
     client_chunks: HashMap<Multihash, ClientChunk>,
+    put_chunks: Option<mpsc::UnboundedSender<Multihash>>,
 
     config: AppConfig,
 }
@@ -493,7 +497,7 @@ enum AppEvent {
     Invite(Multihash),
 
     ClientInvite,
-    // client request
+    ClientPut(mpsc::UnboundedSender<Multihash>),
 }
 
 impl AppControl {
@@ -501,7 +505,11 @@ impl AppControl {
         self.0.send(AppEvent::Close).unwrap();
     }
 
-    // request
+    pub fn request(&self) -> mpsc::UnboundedReceiver<Multihash> {
+        let channel = mpsc::unbounded_channel();
+        self.0.send(AppEvent::ClientPut(channel.0)).unwrap();
+        channel.1
+    }
 }
 
 impl App {
@@ -511,6 +519,7 @@ impl App {
             control: mpsc::unbounded_channel(),
             chunks: Default::default(),
             client_chunks: Default::default(),
+            put_chunks: None,
             addr,
             keypair,
             config,
@@ -569,6 +578,18 @@ impl App {
                 AppEvent::Rpc(_) => {} // do anything?
 
                 AppEvent::ClientInvite => self.client_invite(),
+                AppEvent::ClientPut(channel) => {
+                    assert!(self.put_chunks.is_none());
+                    self.put_chunks = Some(channel);
+                    let mut data = vec![
+                        0;
+                        self.config.fragment_size
+                            * self.config.fragment_k
+                            * self.config.chunk_k
+                    ];
+                    thread_rng().fill_bytes(&mut data);
+                    self.put(&data);
+                }
             }
         }
     }
@@ -685,7 +706,42 @@ impl App {
             .insert(member_id, (Member::new(member, false), channel));
 
         if chunk.indexes.len() >= self.config.fragment_n {
-            todo!()
+            let mut chunk = self.client_chunks.remove(&chunk_hash).unwrap();
+            let members = Vec::from_iter(chunk.members.values_mut().map(|(member, _)| {
+                proto::Member::new(
+                    member.index,
+                    &chunk.indexes[&member.index],
+                    &member.addr,
+                    take(&mut member.proof), // not used any more
+                )
+            }));
+            for (member, channel) in chunk.members.into_values() {
+                let mut fragment = vec![0; self.config.fragment_size];
+                chunk
+                    .encoder
+                    .get_mut()
+                    .unwrap()
+                    .encode(member.index, &mut fragment)
+                    .unwrap();
+                let response = proto::Response::from(proto::QueryFragmentOk {
+                    chunk_hash: chunk_hash.to_bytes(),
+                    member: None,
+                    fragment,
+                    init_members: members.clone(),
+                });
+                self.base.ingress(move |swarm| {
+                    swarm
+                        .behaviour_mut()
+                        .rpc
+                        .send_response(channel, response)
+                        .unwrap();
+                });
+            }
+
+            self.put_chunks.as_ref().unwrap().send(chunk_hash).unwrap();
+            if self.client_chunks.is_empty() {
+                self.put_chunks = None;
+            }
         }
     }
 
@@ -712,6 +768,9 @@ impl App {
     fn check_membership(&mut self, chunk_hash: &Multihash) {
         let chunk = self.chunks.get_mut(chunk_hash).unwrap();
         chunk.retain_alive(&self.config);
+        for member in chunk.members.values_mut() {
+            member.alive = false;
+        }
         if !chunk
             .members
             .contains_key(&PeerId::from_public_key(&self.keypair.public()))
@@ -1008,10 +1067,21 @@ impl App {
     }
 
     fn handle_query_fragment_ok(&mut self, message: &proto::QueryFragmentOk) {
-        let member = message.member.as_ref().unwrap();
         let chunk_hash = message.chunk_hash();
         if !self.chunks.contains_key(&chunk_hash) {
             //
+            return;
+        };
+
+        let Some(member) = &message.member else {
+            // sent from client
+            let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
+            chunk.fragment = Fragment::Complete(message.fragment.clone());
+            for member in &message.init_members {
+                chunk.insert(&chunk_hash, member.public_key().unwrap(), Member::new(member, true), &self.config);
+            }
+            self.set_timer(thread_rng().gen_range(Duration::ZERO..self.config.gossip_interval), AppEvent::Gossip(chunk_hash));
+            self.set_timer(thread_rng().gen_range(Duration::ZERO..self.config.membership_interval), AppEvent::Membership(chunk_hash));
             return;
         };
 
@@ -1020,9 +1090,10 @@ impl App {
             //
             return;
         }
+
+        let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
         // unconditionally insert members that are queried previously
         // mostly for simplifying stuff, and should not break anything
-        let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
         chunk.members.insert(
             PeerId::from_public_key(&public_key),
             Member::new(member, true),
@@ -1062,9 +1133,9 @@ impl App {
         // immediately check membership before sending first gossip?
         self.gossip(&chunk_hash);
         // randomize first membership checking delay to (hopefully) avoid duplicated invitation
+        // all members are marked alive on insertion, so no need to add another full membership interval
         self.set_timer(
-            self.config.membership_interval
-                + thread_rng().gen_range(Duration::ZERO..self.config.membership_interval),
+            thread_rng().gen_range(Duration::ZERO..self.config.membership_interval),
             AppEvent::Membership(chunk_hash),
         );
     }

@@ -11,8 +11,8 @@ On evaluation AWS account, enable evaluated regions and add a key pair called "E
 Prepare control node
 * Run Ubuntu 22.04 (because artifact will be compiled on control node and send to cluster nodes)
     * As user "ubuntu"
-* Install Rust toolchain, C++ toolchain, CMake, Protocol Buffers toolchain, Terraform, Ansible, Jupyter Notebook 
-  environment, Seaborn
+* Install Rust toolchain, C++ toolchain, CMake, Protocol Buffers toolchain, Terraform, Ansible, Jupyter Notebook, 
+  Seaborn
 * Set up AWS credential properly, so it has EC2 and VPC permissions
 * Add this section to SSH config
 ```
@@ -46,4 +46,6 @@ Modify `crates/esys_simulate/src/main.rs` according to desired simulation config
 $ cargo run -r -q --bin esys_simulate > {prefix}-$(date +%s).csv
 ```
 
-Plot the results with `notebooks` scripts.
+Plot the results with `notebooks` scripts. Each script picks up the data files whose prefix matches its own file name.
+Since the result format is universal, all possible simulation configuration should be able to plot by all scripts, but
+some combinations make more sense than the others.
