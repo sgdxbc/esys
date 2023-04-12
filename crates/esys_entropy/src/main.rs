@@ -20,6 +20,8 @@ struct Cli {
     #[clap(long)]
     bootstrap_service: bool,
     #[clap(long)]
+    putget: bool,
+    #[clap(long)]
     service_ip: Option<Ipv4Addr>,
     #[clap(short, default_value_t = 1)]
     n: usize,
@@ -39,10 +41,22 @@ async fn main() {
         drop(app.handle);
         app.event_loop.await.unwrap();
     } else {
-        let mut tasks = Vec::new();
-        for _ in 0..cli.n {
+        let config = AppConfig {
+            invite_count: 1,
+            chunk_k: 1,
+            chunk_n: 1,
+            fragment_k: 2,
+            fragment_n: 4,
+            fragment_size: 64,
+            watermark_interval: Duration::ZERO,
+            membership_interval: Duration::from_secs(86400),
+            gossip_interval: Duration::from_secs(86400),
+            invite_interval: Duration::from_secs(30),
+        };
+
+        let base_task = || async {
             let base = start_base(&cli).await;
-            let task = spawn(async move {
+            spawn(async move {
                 let delay = thread_rng().gen_range(0..5 * 1000);
                 // up to 5s random delay + up to 10s bootstrap latency + safe margin + still want random delay
                 let register_delay = pin!(sleep(Duration::from_millis(20 * 1000 + delay)));
@@ -56,52 +70,54 @@ async fn main() {
                 register_delay.await;
                 base.handle.register().await;
                 base
-            });
-            tasks.push(task);
-        }
+            })
+        };
 
-        let mut bases = Vec::new();
-        for task in tasks {
-            bases.push(task.await.unwrap());
-        }
-        tracing::info!("peers register done");
-
-        let mut base_loops = Vec::new();
-        let mut app_controls = Vec::new();
-        let mut app_loops = Vec::new();
-        for base in bases {
-            base_loops.push(base.event_loop);
-            let mut app = App::new(
-                base.handle,
-                base.keypair,
-                base.addr,
-                AppConfig {
-                    invite_count: 0,
-                    chunk_k: 0,
-                    chunk_n: 0,
-                    fragment_k: 0,
-                    fragment_n: 0,
-                    fragment_size: 0,
-                    watermark_interval: Duration::ZERO,
-                    membership_interval: Duration::ZERO,
-                    gossip_interval: Duration::ZERO,
-                    invite_interval: Duration::ZERO,
-                },
-            );
-            app_controls.push(app.control());
+        if cli.putget {
+            let base = base_task().await.await.unwrap();
+            let mut app = App::new(base.handle, base.keypair, base.addr, config);
+            let control = app.control();
             let app_loop = spawn(async move { app.serve().await });
-            app_loops.push(app_loop);
-        }
-
-        ctrl_c().await.unwrap();
-        for app_control in app_controls {
-            app_control.close();
-        }
-        for app_loop in app_loops {
+            let mut put_chunks = control.put();
+            while let Some(chunk_hash) = put_chunks.recv().await {
+                tracing::info!(?chunk_hash);
+            }
+            control.close();
             app_loop.await.unwrap();
-        }
-        for event_loop in base_loops {
-            event_loop.await.unwrap();
+            base.event_loop.await.unwrap();
+        } else {
+            let mut tasks = Vec::new();
+            for _ in 0..cli.n {
+                tasks.push(base_task().await);
+            }
+
+            let mut bases = Vec::new();
+            for task in tasks {
+                bases.push(task.await.unwrap());
+            }
+            tracing::info!("peers register done");
+
+            let mut base_loops = Vec::new();
+            let mut app_controls = Vec::new();
+            let mut app_loops = Vec::new();
+            for base in bases {
+                base_loops.push(base.event_loop);
+                let mut app = App::new(base.handle, base.keypair, base.addr, config.clone());
+                app_controls.push(app.control());
+                let app_loop = spawn(async move { app.serve().await });
+                app_loops.push(app_loop);
+            }
+
+            ctrl_c().await.unwrap();
+            for app_control in app_controls {
+                app_control.close();
+            }
+            for app_loop in app_loops {
+                app_loop.await.unwrap();
+            }
+            for event_loop in base_loops {
+                event_loop.await.unwrap();
+            }
         }
     }
 }

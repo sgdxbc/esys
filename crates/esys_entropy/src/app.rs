@@ -41,6 +41,7 @@ pub struct App {
 
 pub struct AppControl(mpsc::UnboundedSender<AppEvent>);
 
+#[derive(Debug, Clone)]
 pub struct AppConfig {
     pub invite_count: usize,
     pub chunk_k: usize,
@@ -109,7 +110,7 @@ impl AppControl {
         self.0.send(AppEvent::Close).unwrap();
     }
 
-    pub fn request(&self) -> mpsc::UnboundedReceiver<Multihash> {
+    pub fn put(&self) -> mpsc::UnboundedReceiver<Multihash> {
         let channel = mpsc::unbounded_channel();
         self.0.send(AppEvent::ClientPut(channel.0)).unwrap();
         channel.1
@@ -240,10 +241,9 @@ impl App {
 
     fn client_invite(&mut self) {
         for (chunk_hash, chunk) in &mut self.client_chunks {
-            if chunk.indexes.len() >= self.config.fragment_n {
-                continue;
-            }
+            assert!(chunk.indexes.len() < self.config.fragment_n);
             chunk.index += (self.config.fragment_n - chunk.indexes.len()) as u32;
+            tracing::debug!(chunk = ?chunk_hash, index = ?(0..chunk.index), "invite");
             for index in 0..chunk.index {
                 if chunk.indexes.contains_key(&index) {
                     continue;
@@ -260,11 +260,11 @@ impl App {
                     )],
                 });
                 spawn(Self::invite_index_task(
-                    *chunk_hash,
-                    index,
+                    Self::fragment_hash(chunk_hash, index),
                     self.base.clone(),
                     self.config.invite_count,
                     request,
+                    PeerId::from_public_key(&self.keypair.public()),
                 ));
             }
         }
@@ -290,26 +290,28 @@ impl App {
         // check duplicated index / member
         // a little bit duplicated with the last part of this file but i don't care any more
         if chunk.members.contains_key(&member_id) {
-            //
+            tracing::debug!(chunk = ?chunk_hash, id = %member_id, "same member multiple indexes");
             return;
         }
         if let Some(prev_key) = chunk.indexes.get(&member.index) {
+            tracing::debug!(chunk = ?chunk_hash, index = member.index, "same index multiple members");
             let d = |peer_id: &PeerId| {
                 kbucket::Key::from(peer_id.to_bytes()).distance(&kbucket::Key::from(chunk_hash))
             };
             let prev_id = PeerId::from_public_key(prev_key);
             if d(&prev_id) <= d(&member_id) {
-                //
                 return;
             }
             chunk.members.remove(&prev_id);
         }
+        tracing::debug!(chunk = ?chunk_hash, index = member.index, id = %member_id, "insert member");
         chunk.indexes.insert(member.index, public_key);
         chunk
             .members
             .insert(member_id, (Member::new(member, false), channel));
 
         if chunk.indexes.len() >= self.config.fragment_n {
+            tracing::debug!(chunk = ?chunk_hash, "finalize put");
             let mut chunk = self.client_chunks.remove(&chunk_hash).unwrap();
             let members = Vec::from_iter(chunk.members.values_mut().map(|(member, _)| {
                 proto::Member::new(
@@ -508,25 +510,22 @@ impl App {
                 .collect(),
         });
         spawn(Self::invite_index_task(
-            *chunk_hash,
-            index,
+            Self::fragment_hash(chunk_hash, index),
             self.base.clone(),
             self.config.invite_count,
             request,
+            PeerId::from_public_key(&self.keypair.public()),
         ));
     }
 
     async fn invite_index_task(
-        chunk_hash: Multihash,
-        index: u32,
+        fragment_hash: Multihash,
         base: BaseHandle,
         invite_count: usize,
         request: proto::Request,
+        local_id: PeerId,
     ) {
-        for (peer_id, peer_addr) in base
-            .query(Self::fragment_hash(&chunk_hash, index), invite_count)
-            .await
-        {
+        for (peer_id, peer_addr) in base.query(fragment_hash, invite_count).await {
             // if chunk.members.contains_key(&peer_id) {
             //     continue;
             // }
@@ -537,9 +536,13 @@ impl App {
             //
             // however, should we filter out `joining_memebers` in some way?
 
+            if peer_id == local_id {
+                continue;
+            }
             let Some(peer_addr) = peer_addr else {
                 continue;
             };
+
             let request = request.clone();
             base.ingress(move |swarm| {
                 swarm
@@ -552,12 +555,13 @@ impl App {
 
     fn handle_invite(&mut self, message: &proto::Invite) {
         let chunk_hash = message.chunk_hash();
+        tracing::debug!(chunk = ?chunk_hash, "invited");
         if self.chunks.contains_key(&chunk_hash) {
             return; // need merge?
         }
 
         let Some(proof) = self.prove(&chunk_hash, message.fragment_index) else {
-            //
+            tracing::debug!(chunk = ?chunk_hash, index = message.fragment_index, "not selected");
             return;
         };
 
@@ -598,6 +602,7 @@ impl App {
         self.chunks.insert(chunk_hash, chunk);
 
         // do we really don't need to retry the following?
+        tracing::debug!(chunk = ?chunk_hash, index = message.fragment_index, "query fragment");
         let request = proto::Request::from(proto::QueryFragment {
             chunk_hash: message.chunk_hash.clone(),
             member: Some(proto::Member::new(
@@ -628,7 +633,7 @@ impl App {
             return self.client_handle_query_fragment(message, channel);
         }
         if !self.chunks.contains_key(&chunk_hash) {
-            //
+            tracing::debug!(chunk = ?chunk_hash, "query fragment on missing chunk");
             return;
         }
 
@@ -807,11 +812,12 @@ impl App {
         let fragment_hash = Self::fragment_hash(chunk_hash, index);
         let distance = kbucket::Key::from(fragment_hash).distance(&kbucket::Key::from(*peer_id));
         // TODO tune the probability distribution properly
-        match distance.ilog2() {
-            None => 0.95,
-            Some(i) if i <= 18 => 0.9 - 0.05 * i as f64,
-            _ => 0.,
-        }
+        // match distance.ilog2() {
+        //     None => 0.95,
+        //     Some(i) if i <= 18 => 0.9 - 0.05 * i as f64,
+        //     _ => 0.,
+        // }
+        1.
     }
 
     fn accepted(chunk_hash: &Multihash, index: u32, peer_id: &PeerId, proof: &[u8]) -> bool {
