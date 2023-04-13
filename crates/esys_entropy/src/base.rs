@@ -72,6 +72,11 @@ impl Base {
             rpc: crate::rpc::Behavior::new(
                 Default::default(),
                 [(crate::rpc::Protocol, ProtocolSupport::Full)],
+                // {
+                //     let mut rpc_config = libp2p::request_response::Config::default();
+                //     rpc_config.set_request_timeout(std::time::Duration::from_secs(60));
+                //     rpc_config
+                // },
                 Default::default(),
             ),
         };
@@ -330,6 +335,7 @@ impl BaseHandle {
                         Some(Multiaddr::try_from(result.record.value).unwrap())
                     }
                     Err(GetRecordError::NotFound { .. }) => None,
+                    Err(GetRecordError::Timeout { .. }) => unimplemented!(),
                     _ => unreachable!("either FoundRecord or NotFound should be delivered before"),
                 };
                 ControlFlow::Break(result)

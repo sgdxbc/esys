@@ -24,14 +24,12 @@
   tasks:
   - ansible.builtin.shell: >
       tmux new-session -d -s esys 
-      ./esys_entropy --ip {{ inventory_hostname }} --bootstrap-service
-      || read _
+      "./esys_entropy --ip {{ inventory_hostname }} --bootstrap-service || read _"
 - name: Start normal peers
   hosts: normal
   tasks:
   - ansible.builtin.shell: >
       tmux new-session -d -s esys 
-      ./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 10
-      || read _
+      "./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 100 || read _"
     environment:
       RUST_LOG: esys_entropy=debug

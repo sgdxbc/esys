@@ -12,12 +12,13 @@ use libp2p::{
     identity::{Keypair, PublicKey},
     kad::kbucket,
     multihash::{Code, Hasher, Multihash, MultihashDigest, Sha2_256},
-    request_response::{Message, ResponseChannel},
+    request_response::{InboundFailure, Message, ResponseChannel},
     swarm::{NetworkBehaviour as NetworkBehavior, SwarmEvent::Behaviour as Behavior},
     Multiaddr, PeerId,
 };
 use rand::{random, rngs::StdRng, thread_rng, Rng, RngCore, SeedableRng};
 use tokio::{spawn, sync::mpsc, time::sleep};
+use tracing::Instrument;
 
 use crate::base::BaseHandle;
 
@@ -180,6 +181,16 @@ impl App {
                     QueryFragmentOk(message) => self.handle_query_fragment_ok(&message),
                     QueryProofOk(message) => self.handle_query_proof_ok(&message),
                 },
+                AppEvent::Rpc(libp2p::request_response::Event::OutboundFailure {
+                    error, ..
+                }) => {
+                    tracing::warn!("outbound failure {error:?}")
+                }
+                AppEvent::Rpc(libp2p::request_response::Event::InboundFailure {
+                    error, ..
+                }) if !matches!(error, InboundFailure::ResponseOmission) => {
+                    tracing::warn!("inbound failure {error:?}")
+                }
                 AppEvent::Rpc(_) => {} // do anything?
 
                 AppEvent::ClientInvite => self.client_invite(),
@@ -242,9 +253,11 @@ impl App {
     fn client_invite(&mut self) {
         for (chunk_hash, chunk) in &mut self.client_chunks {
             assert!(chunk.indexes.len() < self.config.fragment_n);
+            let prev_index = chunk.index;
             chunk.index += (self.config.fragment_n - chunk.indexes.len()) as u32;
-            tracing::debug!(chunk = ?chunk_hash, index = ?(0..chunk.index), "invite");
-            for index in 0..chunk.index {
+            // doing eval in a good network so skip retry old indexes
+            tracing::debug!(chunk = ?chunk_hash, index = ?(prev_index..chunk.index), "invite");
+            for index in prev_index..chunk.index {
                 if chunk.indexes.contains_key(&index) {
                     continue;
                 }
@@ -280,8 +293,11 @@ impl App {
         let chunk_hash = message.chunk_hash();
         let member = message.member.as_ref().unwrap();
         let public_key = member.public_key().unwrap();
-        if !self.verify(&chunk_hash, member.index, &public_key, &member.proof) {
-            //
+        if !self.client_verify(&chunk_hash, member.index, &public_key, &member.proof) {
+            tracing::debug!(
+                "fail to verify chunk {chunk_hash:02x?} index {}",
+                member.index
+            );
             return;
         }
 
@@ -290,11 +306,11 @@ impl App {
         // check duplicated index / member
         // a little bit duplicated with the last part of this file but i don't care any more
         if chunk.members.contains_key(&member_id) {
-            tracing::debug!(chunk = ?chunk_hash, id = %member_id, "same member multiple indexes");
+            tracing::debug!(id = %member_id, "same member multiple indexes");
             return;
         }
         if let Some(prev_key) = chunk.indexes.get(&member.index) {
-            tracing::debug!(chunk = ?chunk_hash, index = member.index, "same index multiple members");
+            tracing::debug!(index = member.index, "same index multiple members");
             let d = |peer_id: &PeerId| {
                 kbucket::Key::from(peer_id.to_bytes()).distance(&kbucket::Key::from(chunk_hash))
             };
@@ -304,14 +320,14 @@ impl App {
             }
             chunk.members.remove(&prev_id);
         }
-        tracing::debug!(chunk = ?chunk_hash, index = member.index, id = %member_id, "insert member");
+        tracing::debug!(id = %member_id, "insert member chunk {chunk_hash:02x?} index {}", member.index);
         chunk.indexes.insert(member.index, public_key);
         chunk
             .members
             .insert(member_id, (Member::new(member, false), channel));
 
         if chunk.indexes.len() >= self.config.fragment_n {
-            tracing::debug!(chunk = ?chunk_hash, "finalize put");
+            tracing::debug!("finalize put chunk {chunk_hash:02x?}");
             let mut chunk = self.client_chunks.remove(&chunk_hash).unwrap();
             let members = Vec::from_iter(chunk.members.values_mut().map(|(member, _)| {
                 proto::Member::new(
@@ -525,7 +541,11 @@ impl App {
         request: proto::Request,
         local_id: PeerId,
     ) {
-        for (peer_id, peer_addr) in base.query(fragment_hash, invite_count).await {
+        for (peer_id, peer_addr) in base
+            .query(fragment_hash, invite_count)
+            .instrument(tracing::debug_span!("query"))
+            .await
+        {
             // if chunk.members.contains_key(&peer_id) {
             //     continue;
             // }
@@ -555,17 +575,23 @@ impl App {
 
     fn handle_invite(&mut self, message: &proto::Invite) {
         let chunk_hash = message.chunk_hash();
-        tracing::debug!(chunk = ?chunk_hash, "invited");
+        tracing::debug!(
+            "invited chunk {chunk_hash:02x?} index {}",
+            message.fragment_index
+        );
         if self.chunks.contains_key(&chunk_hash) {
+            tracing::debug!("deplicated invitation chunk {chunk_hash:02x?}");
             return; // need merge?
         }
 
         let Some(proof) = self.prove(&chunk_hash, message.fragment_index) else {
-            tracing::debug!(chunk = ?chunk_hash, index = message.fragment_index, "not selected");
+            tracing::debug!("not selected chunk {chunk_hash:02x?} index {}", message.fragment_index);
             return;
         };
 
-        assert!(message.members.len() >= self.config.fragment_k);
+        // this does not hold any more since client invite contains client as single member
+        // and make it len() == 1 || len() >= k looks so weird
+        // assert!(message.members.len() >= self.config.fragment_k);
         // however we are not sure whether it is valid even after this assert = =
 
         let mut chunk = Chunk {
@@ -602,7 +628,10 @@ impl App {
         self.chunks.insert(chunk_hash, chunk);
 
         // do we really don't need to retry the following?
-        tracing::debug!(chunk = ?chunk_hash, index = message.fragment_index, "query fragment");
+        tracing::debug!(
+            "query fragment chunk {chunk_hash:02x?} index {}",
+            message.fragment_index
+        );
         let request = proto::Request::from(proto::QueryFragment {
             chunk_hash: message.chunk_hash.clone(),
             member: Some(proto::Member::new(
@@ -633,7 +662,7 @@ impl App {
             return self.client_handle_query_fragment(message, channel);
         }
         if !self.chunks.contains_key(&chunk_hash) {
-            tracing::debug!(chunk = ?chunk_hash, "query fragment on missing chunk");
+            tracing::debug!("query fragment on missing  chunk {chunk_hash:02x?}");
             return;
         }
 
@@ -856,8 +885,28 @@ impl App {
     ) -> bool {
         let mut input = chunk_hash.to_bytes();
         input.extend(&index.to_be_bytes());
-        let chunk = &self.chunks[chunk_hash];
-        chunk.watermark(&self.config).contains(&index)
+        self.chunks[chunk_hash]
+            .watermark(&self.config)
+            .contains(&index)
+            && public_key.verify(&input, proof)
+            && Self::accepted(
+                chunk_hash,
+                index,
+                &PeerId::from_public_key(public_key),
+                proof,
+            )
+    }
+
+    fn client_verify(
+        &self,
+        chunk_hash: &Multihash,
+        index: u32,
+        public_key: &PublicKey,
+        proof: &[u8],
+    ) -> bool {
+        let mut input = chunk_hash.to_bytes();
+        input.extend(&index.to_be_bytes());
+        index < self.client_chunks[chunk_hash].index
             && public_key.verify(&input, proof)
             && Self::accepted(
                 chunk_hash,

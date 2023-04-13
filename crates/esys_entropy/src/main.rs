@@ -1,4 +1,4 @@
-use std::{mem::take, net::Ipv4Addr, pin::pin, time::Duration};
+use std::{mem::take, net::Ipv4Addr, ops::Range, pin::pin, time::Duration};
 
 use clap::Parser;
 use esys_entropy::{App, AppConfig, Base, BaseHandle};
@@ -20,7 +20,7 @@ struct Cli {
     #[clap(long)]
     bootstrap_service: bool,
     #[clap(long)]
-    putget: bool,
+    put: bool,
     #[clap(long)]
     service_ip: Option<Ipv4Addr>,
     #[clap(short, default_value_t = 1)]
@@ -36,45 +36,50 @@ async fn main() {
     let cli = Cli::parse();
 
     if cli.bootstrap_service {
-        let app = start_base(&cli).await;
+        let app = start_base(&cli, "service").await;
         ctrl_c().await.unwrap();
         drop(app.handle);
         app.event_loop.await.unwrap();
     } else {
         let config = AppConfig {
             invite_count: 1,
-            chunk_k: 1,
-            chunk_n: 1,
+            chunk_k: 2,
+            chunk_n: 2,
             fragment_k: 2,
             fragment_n: 4,
             fragment_size: 64,
-            watermark_interval: Duration::ZERO,
+            watermark_interval: Duration::from_secs(86400),
             membership_interval: Duration::from_secs(86400),
             gossip_interval: Duration::from_secs(86400),
             invite_interval: Duration::from_secs(30),
         };
 
-        let base_task = || async {
-            let base = start_base(&cli).await;
-            spawn(async move {
-                let delay = thread_rng().gen_range(0..5 * 1000);
-                // up to 5s random delay + up to 10s bootstrap latency + safe margin + still want random delay
-                let register_delay = pin!(sleep(Duration::from_millis(20 * 1000 + delay)));
+        let init_base =
+            |base: StartBase, delay_range: Range<Duration>, register_after: Duration| {
+                spawn(async move {
+                    let delay = thread_rng().gen_range(delay_range);
+                    let register_delay = pin!(sleep(register_after + delay));
 
-                sleep(Duration::from_millis(delay)).await;
-                base.handle
-                    .boostrap(multiaddr!(Ip4(cli.service_ip.unwrap()), Tcp(8500u16)))
-                    .instrument(debug_span!("bootstrap", addr = %base.addr))
-                    .await;
+                    sleep(delay).await;
+                    base.handle
+                        .boostrap(multiaddr!(Ip4(cli.service_ip.unwrap()), Tcp(8500u16)))
+                        .instrument(debug_span!("bootstrap", addr = %base.addr))
+                        .await;
 
-                register_delay.await;
-                base.handle.register().await;
-                base
-            })
-        };
+                    register_delay.await;
+                    base.handle.register().await;
+                    base
+                })
+            };
 
-        if cli.putget {
-            let base = base_task().await.await.unwrap();
+        if cli.put {
+            let base = init_base(
+                start_base(&cli, "put").await,
+                Duration::ZERO..Duration::from_millis(1),
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
             let mut app = App::new(base.handle, base.keypair, base.addr, config);
             let control = app.control();
             let app_loop = spawn(async move { app.serve().await });
@@ -87,8 +92,13 @@ async fn main() {
             base.event_loop.await.unwrap();
         } else {
             let mut tasks = Vec::new();
-            for _ in 0..cli.n {
-                tasks.push(base_task().await);
+            for i in 0..cli.n {
+                tasks.push(init_base(
+                    start_base(&cli, format!("normal-{i}")).await,
+                    Duration::ZERO..Duration::from_millis(5 * 1000),
+                    // up to 5s random delay + up to 10s bootstrap latency + safe margin
+                    Duration::from_millis(20 * 1000),
+                ));
             }
 
             let mut bases = Vec::new();
@@ -129,14 +139,14 @@ struct StartBase {
     addr: Multiaddr,
 }
 
-async fn start_base(cli: &Cli) -> StartBase {
+async fn start_base(cli: &Cli, name: impl ToString) -> StartBase {
     let id_keys = Keypair::generate_ed25519();
     let transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
         .upgrade(V1)
         .authenticate(libp2p::noise::NoiseAuthenticated::xx(&id_keys).unwrap())
         .multiplex(libp2p::yamux::YamuxConfig::default())
         .boxed();
-    let (event_loop, handle) = Base::run("", transport, &id_keys);
+    let (event_loop, handle) = Base::run(name, transport, &id_keys);
     let mut first_addr = true;
     let ip = cli.ip;
     let notify = handle.serve_add_external_address(move |addr| {

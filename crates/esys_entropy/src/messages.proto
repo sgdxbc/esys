@@ -65,3 +65,4 @@ message Member {
     bytes public_key = 4;
     bytes proof = 5;
 }
+`
