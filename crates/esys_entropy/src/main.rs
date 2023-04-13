@@ -8,9 +8,9 @@ use libp2p::{
     multiaddr::{multiaddr, Protocol},
     tcp, Multiaddr, Swarm, Transport,
 };
-use rand::{thread_rng, Rng};
+use rand::{thread_rng, Rng, RngCore};
 use tokio::{signal::ctrl_c, spawn, task::JoinHandle, time::sleep};
-use tracing::{debug_span, Instrument};
+use tracing::{debug_span, info_span, Instrument};
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
 #[derive(Parser)]
@@ -43,15 +43,15 @@ async fn main() {
     } else {
         let config = AppConfig {
             invite_count: 1,
-            chunk_k: 2,
-            chunk_n: 2,
-            fragment_k: 2,
-            fragment_n: 4,
-            fragment_size: 64,
+            chunk_k: 4,
+            chunk_n: 5,
+            fragment_k: 8,
+            fragment_n: 8,
+            fragment_size: 1 << 25, // (1 << 2) * (1 << 3) * (1 << 25) = 1GB
             watermark_interval: Duration::from_secs(86400),
             membership_interval: Duration::from_secs(86400),
             gossip_interval: Duration::from_secs(86400),
-            invite_interval: Duration::from_secs(30),
+            invite_interval: Duration::from_secs(10),
         };
 
         let init_base =
@@ -80,13 +80,19 @@ async fn main() {
             )
             .await
             .unwrap();
+            let mut data = vec![0; config.fragment_size * config.fragment_k * config.chunk_k];
             let mut app = App::new(base.handle, base.keypair, base.addr, config);
             let control = app.control();
             let app_loop = spawn(async move { app.serve().await });
-            let mut put_chunks = control.put();
-            while let Some(chunk_hash) = put_chunks.recv().await {
-                tracing::info!(?chunk_hash);
+            thread_rng().fill_bytes(&mut data);
+            async {
+                let mut put_chunks = control.put(data);
+                while let Some(chunk_hash) = put_chunks.recv().await {
+                    tracing::info!("put chunk {chunk_hash:02x?}");
+                }
             }
+            .instrument(info_span!("put"))
+            .await;
             control.close();
             app_loop.await.unwrap();
             base.event_loop.await.unwrap();
@@ -95,9 +101,10 @@ async fn main() {
             for i in 0..cli.n {
                 tasks.push(init_base(
                     start_base(&cli, format!("normal-{i}")).await,
-                    Duration::ZERO..Duration::from_millis(5 * 1000),
-                    // up to 5s random delay + up to 10s bootstrap latency + safe margin
-                    Duration::from_millis(20 * 1000),
+                    // wait for the farest peers
+                    Duration::ZERO..Duration::from_millis(20 * 1000),
+                    // up to 20s random delay diff + up to 40s bootstrap latency
+                    Duration::from_millis(60 * 1000),
                 ));
             }
 

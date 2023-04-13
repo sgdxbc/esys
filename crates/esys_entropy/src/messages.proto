@@ -17,6 +17,7 @@ message Response {
     oneof inner {
         QueryFragmentOk query_fragment_ok = 1;
         QueryProofOk query_proof_ok = 2;
+        Ok ok = 3;
     }
 }
 
@@ -65,4 +66,5 @@ message Member {
     bytes public_key = 4;
     bytes proof = 5;
 }
-`
+
+message Ok {}

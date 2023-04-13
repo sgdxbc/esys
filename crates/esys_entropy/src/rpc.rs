@@ -85,6 +85,7 @@ pub mod proto {
     impl_from!(QueryProof, Request, request::Inner);
     impl_from!(QueryFragmentOk, Response, response::Inner);
     impl_from!(QueryProofOk, Response, response::Inner);
+    impl_from!(Ok, Response, response::Inner);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -99,6 +100,7 @@ impl ProtocolName for Protocol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct Codec;
 
+const MAX_LENGTH: usize = 1 << 30;
 #[async_trait::async_trait]
 impl request_response::Codec for Codec {
     type Protocol = Protocol;
@@ -109,7 +111,7 @@ impl request_response::Codec for Codec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let message = read_length_prefixed(io, 64 << 10).await?;
+        let message = read_length_prefixed(io, MAX_LENGTH).await?;
         if message.is_empty() {
             Err(io::ErrorKind::UnexpectedEof.into())
         } else {
@@ -128,7 +130,7 @@ impl request_response::Codec for Codec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let message = read_length_prefixed(io, 64 << 10).await?;
+        let message = read_length_prefixed(io, MAX_LENGTH).await?;
         if message.is_empty() {
             Err(io::ErrorKind::UnexpectedEof.into())
         } else {
@@ -149,7 +151,7 @@ impl request_response::Codec for Codec {
         T: AsyncWrite + Unpin + Send,
     {
         let message = request.encode_to_vec();
-        assert!(message.len() < 64 << 10);
+        assert!(message.len() < MAX_LENGTH);
         write_length_prefixed(io, message).await
     }
 
@@ -163,7 +165,7 @@ impl request_response::Codec for Codec {
         T: AsyncWrite + Unpin + Send,
     {
         let message = response.encode_to_vec();
-        assert!(message.len() < 64 << 10);
+        assert!(message.len() < MAX_LENGTH);
         write_length_prefixed(io, message).await
     }
 }

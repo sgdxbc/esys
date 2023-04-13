@@ -83,6 +83,7 @@ unsafe fn wirehair_init() -> WirehairResult {
 #[derive(Debug)]
 pub struct WirehairEncoder {
     raw: *mut WirehairCodecRaw,
+    message: Vec<u8>,
     pub block_bytes: u32,
 }
 unsafe impl Send for WirehairEncoder {} // really?
@@ -101,7 +102,7 @@ unsafe impl Send for WirehairDecoder {}
 
 static INIT: Once = Once::new();
 impl WirehairEncoder {
-    pub fn new(message: &[u8], block_bytes: u32) -> Self {
+    pub fn new(message: Vec<u8>, block_bytes: u32) -> Self {
         INIT.call_once(|| unsafe {
             wirehair_init().with(()).unwrap();
         });
@@ -114,7 +115,11 @@ impl WirehairEncoder {
             )
         };
         assert!(!raw.is_null());
-        Self { raw, block_bytes }
+        Self {
+            raw,
+            block_bytes,
+            message,
+        }
     }
 
     pub fn encode(&mut self, id: u32, block: &mut [u8]) -> Result<usize, WirehairResult> {
@@ -176,6 +181,7 @@ impl WirehairDecoder {
         unsafe { wirehair_decoder_becomes_encoder(self.raw) }.with(WirehairEncoder {
             raw: self.raw,
             block_bytes: self.block_bytes,
+            message: Default::default(), // seems like we don't need to hold a message in this case (really?)
         })
     }
 }
@@ -202,7 +208,7 @@ mod tests {
 
         for _ in 0..100 {
             thread_rng().fill(&mut message[..]);
-            let mut encoder = WirehairEncoder::new(&message, block_bytes);
+            let mut encoder = WirehairEncoder::new(message.clone(), block_bytes);
             let mut decoder = WirehairDecoder::new(message.len() as _, block_bytes);
             for i in 0.. {
                 let mut block = vec![0; block_bytes as _];

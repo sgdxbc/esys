@@ -16,7 +16,7 @@ use libp2p::{
     swarm::{NetworkBehaviour as NetworkBehavior, SwarmEvent::Behaviour as Behavior},
     Multiaddr, PeerId,
 };
-use rand::{random, rngs::StdRng, thread_rng, Rng, RngCore, SeedableRng};
+use rand::{random, rngs::StdRng, thread_rng, Rng, SeedableRng};
 use tokio::{spawn, sync::mpsc, time::sleep};
 use tracing::Instrument;
 
@@ -103,7 +103,7 @@ enum AppEvent {
     Invite(Multihash),
 
     ClientInvite,
-    ClientPut(mpsc::UnboundedSender<Multihash>),
+    ClientPut(Vec<u8>, mpsc::UnboundedSender<Multihash>),
 }
 
 impl AppControl {
@@ -111,9 +111,9 @@ impl AppControl {
         self.0.send(AppEvent::Close).unwrap();
     }
 
-    pub fn put(&self) -> mpsc::UnboundedReceiver<Multihash> {
+    pub fn put(&self, data: Vec<u8>) -> mpsc::UnboundedReceiver<Multihash> {
         let channel = mpsc::unbounded_channel();
-        self.0.send(AppEvent::ClientPut(channel.0)).unwrap();
+        self.0.send(AppEvent::ClientPut(data, channel.0)).unwrap();
         channel.1
     }
 }
@@ -142,14 +142,16 @@ impl App {
             match event.take().unwrap() {
                 Behavior(BaseEvent::Rpc(event)) => {
                     if control.send(AppEvent::Rpc(event)).is_err() {
-                        return ControlFlow::Break(());
+                        // return ControlFlow::Break(());
+                        // we are breaking but not waiting for the result, i.e. drop(s) instead of s.await
+                        // the better way is to do s.await somewhere appropriate, maybe later TODO
                     }
                 }
                 other_event => {
                     *event = Some(other_event);
                 }
             }
-            ControlFlow::Continue(())
+            ControlFlow::<()>::Continue(())
         });
         drop(s);
 
@@ -169,8 +171,17 @@ impl App {
                         },
                     ..
                 }) => match request.inner.unwrap() {
-                    Gossip(message) => self.handle_gossip(&message), // no response
-                    Invite(message) => self.handle_invite(&message), // no response
+                    Gossip(message) => self.handle_gossip(&message),
+                    Invite(message) => {
+                        self.base.ingress(move |swarm| {
+                            swarm
+                                .behaviour_mut()
+                                .rpc
+                                .send_response(channel, proto::Response::from(proto::Ok {}))
+                                .unwrap();
+                        });
+                        self.handle_invite(&message);
+                    }
                     QueryFragment(message) => self.handle_query_fragment(&message, channel),
                     QueryProof(message) => self.handle_query_proof(&message, channel),
                 },
@@ -180,6 +191,7 @@ impl App {
                 }) => match response.inner.unwrap() {
                     QueryFragmentOk(message) => self.handle_query_fragment_ok(&message),
                     QueryProofOk(message) => self.handle_query_proof_ok(&message),
+                    Ok(proto::Ok {}) => {}
                 },
                 AppEvent::Rpc(libp2p::request_response::Event::OutboundFailure {
                     error, ..
@@ -194,17 +206,10 @@ impl App {
                 AppEvent::Rpc(_) => {} // do anything?
 
                 AppEvent::ClientInvite => self.client_invite(),
-                AppEvent::ClientPut(channel) => {
+                AppEvent::ClientPut(data, channel) => {
                     assert!(self.put_chunks.is_none());
                     self.put_chunks = Some(channel);
-                    let mut data = vec![
-                        0;
-                        self.config.fragment_size
-                            * self.config.fragment_k
-                            * self.config.chunk_k
-                    ];
-                    thread_rng().fill_bytes(&mut data);
-                    self.put(&data);
+                    self.put(data);
                 }
             }
         }
@@ -218,35 +223,37 @@ impl App {
         });
     }
 
-    fn put(&mut self, data: &[u8]) {
+    fn put(&mut self, data: Vec<u8>) {
         assert!(self.client_chunks.is_empty());
         assert_eq!(
             data.len(),
             self.config.fragment_size * self.config.fragment_k * self.config.chunk_k
         );
-        let mut outer_encoder = WirehairEncoder::new(
-            data,
-            (self.config.fragment_size * self.config.fragment_k) as _,
-        );
-        let mut buffer = vec![0; self.config.fragment_size * self.config.fragment_k];
-        for _ in 0..self.config.chunk_n {
-            outer_encoder.encode(random(), &mut buffer).unwrap();
-            let chunk_hash = Code::Sha2_256.digest(&buffer);
-            let chunk = ClientChunk {
-                encoder: Mutex::new(WirehairEncoder::new(
-                    &buffer,
-                    self.config.fragment_size as _,
-                )),
-                enter_time_sec: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                index: 0,
-                members: Default::default(),
-                indexes: Default::default(),
-            };
-            self.client_chunks.insert(chunk_hash, chunk);
-        }
+        tracing::info_span!("encoding").in_scope(|| {
+            let mut outer_encoder = WirehairEncoder::new(
+                data,
+                (self.config.fragment_size * self.config.fragment_k) as _,
+            );
+            for _ in 0..self.config.chunk_n {
+                let mut buffer = vec![0; self.config.fragment_size * self.config.fragment_k];
+                outer_encoder.encode(random(), &mut buffer).unwrap();
+                let chunk_hash = Code::Sha2_256.digest(&buffer);
+                let chunk = ClientChunk {
+                    encoder: Mutex::new(WirehairEncoder::new(
+                        buffer,
+                        self.config.fragment_size as _,
+                    )),
+                    enter_time_sec: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs(),
+                    index: 0,
+                    members: Default::default(),
+                    indexes: Default::default(),
+                };
+                self.client_chunks.insert(chunk_hash, chunk);
+            }
+        });
         self.client_invite();
     }
 
@@ -543,7 +550,7 @@ impl App {
     ) {
         for (peer_id, peer_addr) in base
             .query(fragment_hash, invite_count)
-            .instrument(tracing::debug_span!("query"))
+            // .instrument(tracing::debug_span!("query"))
             .await
         {
             // if chunk.members.contains_key(&peer_id) {
