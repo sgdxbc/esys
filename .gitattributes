@@ -1,2 +1,2 @@
-inventory.ini.tpl linguist-language=Jinja
+inventory.ini.tftpl linguist-language=Jinja
 playbook*.yml linguist-detectable

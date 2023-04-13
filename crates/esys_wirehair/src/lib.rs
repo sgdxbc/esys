@@ -2,7 +2,7 @@ use std::{
     ffi::{c_int, c_uint, c_void},
     marker::{PhantomData, PhantomPinned},
     ptr::null_mut,
-    sync::Once,
+    sync::{Arc, Once},
 };
 
 #[repr(C)]
@@ -83,10 +83,11 @@ unsafe fn wirehair_init() -> WirehairResult {
 #[derive(Debug)]
 pub struct WirehairEncoder {
     raw: *mut WirehairCodecRaw,
-    message: Vec<u8>,
+    message: Arc<Vec<u8>>,
     pub block_bytes: u32,
 }
 unsafe impl Send for WirehairEncoder {} // really?
+unsafe impl Sync for WirehairEncoder {}
 
 // not sure whether underlying object is `Sync` or not so let's play safe
 
@@ -118,11 +119,11 @@ impl WirehairEncoder {
         Self {
             raw,
             block_bytes,
-            message,
+            message: Arc::new(message),
         }
     }
 
-    pub fn encode(&mut self, id: u32, block: &mut [u8]) -> Result<usize, WirehairResult> {
+    pub fn encode(&self, id: u32, block: &mut [u8]) -> Result<usize, WirehairResult> {
         assert!(block.len() >= self.block_bytes as _);
         let mut out_len = Default::default();
         unsafe {
@@ -135,6 +136,24 @@ impl WirehairEncoder {
             )
         }
         .with(out_len as _)
+    }
+}
+
+impl Clone for WirehairEncoder {
+    fn clone(&self) -> Self {
+        let raw = unsafe {
+            wirehair_encoder_create(
+                null_mut(),
+                self.message.as_ptr().cast(),
+                self.message.len() as _,
+                self.block_bytes,
+            )
+        };
+        Self {
+            raw,
+            block_bytes: self.block_bytes,
+            message: self.message.clone(),
+        }
     }
 }
 
@@ -170,7 +189,7 @@ impl WirehairDecoder {
         result.with(result == WirehairResult::Success)
     }
 
-    pub fn recover(&mut self, message: &mut [u8]) -> Result<(), WirehairResult> {
+    pub fn recover(&self, message: &mut [u8]) -> Result<(), WirehairResult> {
         assert!(message.len() >= self.message_bytes as usize);
         unsafe { wirehair_recover(self.raw, message.as_mut_ptr().cast(), message.len() as _) }
             .with(())
@@ -208,7 +227,7 @@ mod tests {
 
         for _ in 0..100 {
             thread_rng().fill(&mut message[..]);
-            let mut encoder = WirehairEncoder::new(message.clone(), block_bytes);
+            let encoder = WirehairEncoder::new(message.clone(), block_bytes);
             let mut decoder = WirehairDecoder::new(message.len() as _, block_bytes);
             for i in 0.. {
                 let mut block = vec![0; block_bytes as _];

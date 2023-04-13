@@ -25,6 +25,17 @@ struct Cli {
     service_ip: Option<Ipv4Addr>,
     #[clap(short, default_value_t = 1)]
     n: usize,
+
+    #[clap(long, default_value_t = 100)]
+    chunk_k: usize,
+    #[clap(long, default_value_t = 100)]
+    chunk_n: usize,
+    #[clap(long, default_value_t = 64)]
+    fragment_k: usize,
+    #[clap(long, default_value_t = 100)]
+    fragment_n: usize,
+    #[clap(long, default_value_t = 0)]
+    fragment_size: usize,
 }
 
 #[tokio::main]
@@ -43,15 +54,19 @@ async fn main() {
     } else {
         let config = AppConfig {
             invite_count: 1,
-            chunk_k: 4,
-            chunk_n: 5,
-            fragment_k: 8,
-            fragment_n: 8,
-            fragment_size: 1 << 25, // (1 << 2) * (1 << 3) * (1 << 25) = 1GB
+            chunk_k: cli.chunk_k,
+            chunk_n: cli.chunk_n,
+            fragment_k: cli.fragment_k,
+            fragment_n: cli.fragment_n,
+            fragment_size: if cli.fragment_size == 0 {
+                (1 << 30) / cli.chunk_k / cli.fragment_k
+            } else {
+                cli.fragment_size
+            },
             watermark_interval: Duration::from_secs(86400),
             membership_interval: Duration::from_secs(86400),
             gossip_interval: Duration::from_secs(86400),
-            invite_interval: Duration::from_secs(10),
+            invite_interval: Duration::from_secs(600),
         };
 
         let init_base =
@@ -104,7 +119,7 @@ async fn main() {
                     // wait for the farest peers
                     Duration::ZERO..Duration::from_millis(20 * 1000),
                     // up to 20s random delay diff + up to 40s bootstrap latency
-                    Duration::from_millis(60 * 1000),
+                    Duration::from_millis(80 * 1000),
                 ));
             }
 

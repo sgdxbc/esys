@@ -43,7 +43,8 @@ module "service" {
     aws = aws.ap-east-1
   }
 
-  instance_type = "r5.large"
+  instance_type  = "c5.2xlarge"
+  instance_count = 1
 }
 
 module "region-1" {
@@ -83,19 +84,13 @@ module "region-5" {
 
 resource "local_file" "inventory" {
   content = templatefile(
-    "${path.module}/inventory.ini.tpl", {
-      service       = module.service.ip,
-      service-host  = module.service.dns,
-      region-1      = module.region-1.ip,
-      region-1-host = module.region-1.dns,
-      region-2      = module.region-2.ip,
-      region-2-host = module.region-2.dns,
-      region-3      = module.region-3.ip,
-      region-3-host = module.region-3.dns,
-      region-4      = module.region-4.ip,
-      region-4-host = module.region-4.dns,
-      region-5      = module.region-5.ip,
-      region-5-host = module.region-5.dns,
+    "${path.module}/inventory.ini.tftpl", {
+      service       = module.service.instances,
+      region-1      = module.region-1.instances,
+      region-2      = module.region-2.instances,
+      region-3      = module.region-3.instances,
+      region-4      = module.region-4.instances,
+      region-5      = module.region-5.instances,
   })
   filename = "../../../inventory.ini"
 }

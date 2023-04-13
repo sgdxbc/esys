@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     mem::{replace, take},
     ops::{ControlFlow, RangeInclusive},
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -17,7 +17,7 @@ use libp2p::{
     Multiaddr, PeerId,
 };
 use rand::{random, rngs::StdRng, thread_rng, Rng, SeedableRng};
-use tokio::{spawn, sync::mpsc, time::sleep};
+use tokio::{spawn, sync::mpsc, task::spawn_blocking, time::sleep};
 use tracing::Instrument;
 
 use crate::base::BaseHandle;
@@ -86,7 +86,7 @@ enum Fragment {
 }
 
 struct ClientChunk {
-    encoder: Mutex<WirehairEncoder>,
+    encoder: WirehairEncoder,
     enter_time_sec: u64,
     index: u32,
     members: HashMap<PeerId, (Member, ResponseChannel<proto::Response>)>,
@@ -209,7 +209,7 @@ impl App {
                 AppEvent::ClientPut(data, channel) => {
                     assert!(self.put_chunks.is_none());
                     self.put_chunks = Some(channel);
-                    self.put(data);
+                    self.put(data).await;
                 }
             }
         }
@@ -223,26 +223,30 @@ impl App {
         });
     }
 
-    fn put(&mut self, data: Vec<u8>) {
+    async fn put(&mut self, data: Vec<u8>) {
         assert!(self.client_chunks.is_empty());
         assert_eq!(
             data.len(),
             self.config.fragment_size * self.config.fragment_k * self.config.chunk_k
         );
-        tracing::info_span!("encoding").in_scope(|| {
-            let mut outer_encoder = WirehairEncoder::new(
+        let encode_span = tracing::info_span!("encode");
+        let outer_encoder = encode_span.in_scope(|| {
+            Arc::new(WirehairEncoder::new(
                 data,
                 (self.config.fragment_size * self.config.fragment_k) as _,
-            );
-            for _ in 0..self.config.chunk_n {
-                let mut buffer = vec![0; self.config.fragment_size * self.config.fragment_k];
+            ))
+        });
+        let mut tasks = Vec::new();
+        for _ in 0..self.config.chunk_n {
+            let fragment_size = self.config.fragment_size;
+            let fragment_k = self.config.fragment_k;
+            let outer_encoder = outer_encoder.clone();
+            let task = spawn_blocking(move || {
+                let mut buffer = vec![0; fragment_size * fragment_k];
                 outer_encoder.encode(random(), &mut buffer).unwrap();
                 let chunk_hash = Code::Sha2_256.digest(&buffer);
                 let chunk = ClientChunk {
-                    encoder: Mutex::new(WirehairEncoder::new(
-                        buffer,
-                        self.config.fragment_size as _,
-                    )),
+                    encoder: WirehairEncoder::new(buffer, fragment_size as _),
                     enter_time_sec: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
@@ -251,9 +255,14 @@ impl App {
                     members: Default::default(),
                     indexes: Default::default(),
                 };
-                self.client_chunks.insert(chunk_hash, chunk);
-            }
-        });
+                (chunk_hash, chunk)
+            });
+            tasks.push(task);
+        }
+        for task in tasks {
+            let (chunk_hash, chunk) = task.instrument(encode_span.clone()).await.unwrap();
+            self.client_chunks.insert(chunk_hash, chunk);
+        }
         self.client_invite();
     }
 
@@ -261,9 +270,10 @@ impl App {
         for (chunk_hash, chunk) in &mut self.client_chunks {
             assert!(chunk.indexes.len() < self.config.fragment_n);
             let prev_index = chunk.index;
-            chunk.index += (self.config.fragment_n - chunk.indexes.len()) as u32;
+            // add some backup invitations to make sure success in the first try
+            chunk.index += (((self.config.fragment_n - chunk.indexes.len()) as f32) * 1.2) as u32;
             // doing eval in a good network so skip retry old indexes
-            tracing::debug!(chunk = ?chunk_hash, index = ?(prev_index..chunk.index), "invite");
+            tracing::debug!(index = ?(prev_index..chunk.index), "invite chunk {chunk_hash:02x?}");
             for index in prev_index..chunk.index {
                 if chunk.indexes.contains_key(&index) {
                     continue;
@@ -344,26 +354,32 @@ impl App {
                     take(&mut member.proof), // not used any more
                 )
             }));
+            let encoder = Arc::new(chunk.encoder);
             for (member, channel) in chunk.members.into_values() {
-                let mut fragment = vec![0; self.config.fragment_size];
-                chunk
-                    .encoder
-                    .get_mut()
-                    .unwrap()
-                    .encode(member.index, &mut fragment)
-                    .unwrap();
-                let response = proto::Response::from(proto::QueryFragmentOk {
-                    chunk_hash: chunk_hash.to_bytes(),
-                    member: None,
-                    fragment,
-                    init_members: members.clone(),
-                });
-                self.base.ingress(move |swarm| {
-                    swarm
-                        .behaviour_mut()
-                        .rpc
-                        .send_response(channel, response)
-                        .unwrap();
+                let encoder = encoder.clone();
+                let base = self.base.clone();
+                let fragment_size = self.config.fragment_size;
+                let members = members.clone();
+                if !channel.is_open() {
+                    tracing::warn!(index = member.index, "skip closed response channel");
+                    continue;
+                }
+                spawn(async move {
+                    let mut fragment = vec![0; fragment_size];
+                    encoder.encode(member.index, &mut fragment).unwrap();
+                    let response = proto::Response::from(proto::QueryFragmentOk {
+                        chunk_hash: chunk_hash.to_bytes(),
+                        member: None,
+                        fragment,
+                        init_members: members.clone(),
+                    });
+                    base.ingress(move |swarm| {
+                        swarm
+                            .behaviour_mut()
+                            .rpc
+                            .send_response(channel, response)
+                            .unwrap();
+                    });
                 });
             }
 
@@ -408,7 +424,13 @@ impl App {
             return;
         }
 
-        assert!(chunk.fragment_count() >= self.config.fragment_k);
+        // assert!(chunk.fragment_count() >= self.config.fragment_k);
+        if chunk.fragment_count() < self.config.fragment_k {
+            tracing::warn!("exit non-recoverable group chunk {chunk_hash:02x?}");
+            self.chunks.remove(chunk_hash);
+            return;
+        }
+
         self.invite(chunk_hash);
         self.set_timer(
             self.config.membership_interval,
@@ -550,7 +572,7 @@ impl App {
     ) {
         for (peer_id, peer_addr) in base
             .query(fragment_hash, invite_count)
-            // .instrument(tracing::debug_span!("query"))
+            .instrument(tracing::debug_span!("query"))
             .await
         {
             // if chunk.members.contains_key(&peer_id) {
@@ -564,9 +586,11 @@ impl App {
             // however, should we filter out `joining_memebers` in some way?
 
             if peer_id == local_id {
+                tracing::debug!("query returns local id");
                 continue;
             }
             let Some(peer_addr) = peer_addr else {
+                tracing::debug!("query returns no address");
                 continue;
             };
 
@@ -669,7 +693,14 @@ impl App {
             return self.client_handle_query_fragment(message, channel);
         }
         if !self.chunks.contains_key(&chunk_hash) {
-            tracing::debug!("query fragment on missing  chunk {chunk_hash:02x?}");
+            tracing::debug!("query fragment on missing chunk {chunk_hash:02x?}");
+            self.base.ingress(move |swarm| {
+                swarm
+                    .behaviour_mut()
+                    .rpc
+                    .send_response(channel, proto::Response::from(proto::Ok {}))
+                    .unwrap()
+            });
             return;
         }
 
@@ -722,8 +753,12 @@ impl App {
             // sent from client
             let chunk = self.chunks.get_mut(&chunk_hash).unwrap();
             chunk.fragment = Fragment::Complete(message.fragment.clone());
+            chunk.high_watermark = chunk.fragment_index;
             for member in &message.init_members {
-                chunk.insert(&chunk_hash, member.public_key().unwrap(), Member::new(member, true), &self.config);
+                // unconditional follow client's info
+                chunk.indexes.insert(member.index, member.public_key().unwrap());
+                chunk.members.insert(PeerId::from_public_key(&member.public_key().unwrap()), Member::new(member, true));
+                chunk.high_watermark = u32::max(chunk.high_watermark, member.index);
             }
             self.set_timer(thread_rng().gen_range(Duration::ZERO..self.config.gossip_interval), AppEvent::Gossip(chunk_hash));
             self.set_timer(thread_rng().gen_range(Duration::ZERO..self.config.membership_interval), AppEvent::Membership(chunk_hash));
@@ -853,7 +888,7 @@ impl App {
         //     Some(i) if i <= 18 => 0.9 - 0.05 * i as f64,
         //     _ => 0.,
         // }
-        1.
+        f64::min(distance.ilog2().unwrap_or(1) as _, 1.)
     }
 
     fn accepted(chunk_hash: &Multihash, index: u32, peer_id: &PeerId, proof: &[u8]) -> bool {

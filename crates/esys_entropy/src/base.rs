@@ -1,4 +1,4 @@
-use std::{future::Future, mem::take, ops::ControlFlow, sync::Arc};
+use std::{future::Future, mem::take, ops::ControlFlow, sync::Arc, time::Duration};
 
 use libp2p::{
     core::{muxing::StreamMuxerBox, transport, ConnectedPoint},
@@ -20,9 +20,10 @@ use libp2p::{
     Multiaddr, PeerId, Swarm,
 };
 
+use rand::Rng;
 use tokio::{
     select, spawn,
-    sync::{mpsc, oneshot, Notify},
+    sync::{mpsc, oneshot, Notify, Semaphore},
     task::JoinHandle,
 };
 use tracing::{
@@ -49,6 +50,7 @@ impl Base {
 #[derive(Clone)]
 pub struct BaseHandle {
     ingress: mpsc::UnboundedSender<IngressTask>,
+    query_resource: Arc<Semaphore>,
 }
 
 type IngressTask = Box<dyn FnOnce(&mut Swarm<Base>, &mut Vec<AppObserver>) + Send>;
@@ -72,17 +74,20 @@ impl Base {
             rpc: crate::rpc::Behavior::new(
                 Default::default(),
                 [(crate::rpc::Protocol, ProtocolSupport::Full)],
-                // {
-                //     let mut rpc_config = libp2p::request_response::Config::default();
-                //     rpc_config.set_request_timeout(std::time::Duration::from_secs(60));
-                //     rpc_config
-                // },
-                Default::default(),
+                {
+                    let mut rpc_config = libp2p::request_response::Config::default();
+                    rpc_config.set_request_timeout(std::time::Duration::from_secs(60));
+                    rpc_config
+                },
+                // Default::default(),
             ),
         };
         let mut swarm = SwarmBuilder::with_tokio_executor(transport, app, id).build();
         let mut ingress = mpsc::unbounded_channel();
-        let handle = BaseHandle { ingress: ingress.0 };
+        let handle = BaseHandle {
+            ingress: ingress.0,
+            query_resource: Arc::new(Semaphore::new(100)),
+        };
         let name = name.to_string();
         let event_loop = spawn(async move {
             tracing::trace!("launch app event looop");
@@ -208,6 +213,10 @@ impl BaseHandle {
             ControlFlow::<()>::Continue(())
         });
         drop(s);
+    }
+
+    pub async fn cancel_queries(&self) {
+        //
     }
 
     pub async fn boostrap(&self, service: Multiaddr) {
@@ -350,6 +359,9 @@ impl BaseHandle {
 
     // given a key (e.g. hash of encoded fragment), find closest peers' id and address
     pub async fn query(&self, key: Multihash, n: usize) -> Vec<(PeerId, Option<Multiaddr>)> {
+        let backoff = rand::thread_rng().gen_range(Duration::ZERO..Duration::from_millis(1 * 1000));
+        tokio::time::sleep(backoff).await;
+        let _guard = self.query_resource.acquire().await.unwrap();
         let find_id = self
             .ingress_wait(move |swarm| swarm.behaviour_mut().kad.get_closest_peers(key))
             .await;

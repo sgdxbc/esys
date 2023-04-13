@@ -74,10 +74,17 @@ data "aws_ami" "ubuntu" {
 
 variable "instance_type" {
   type    = string
-  default = "c5.2xlarge"
+  default = "c5.9xlarge"
+}
+
+variable "instance_count" {
+  type    = number
+  default = 1
 }
 
 resource "aws_instance" "esys-entropy" {
+  count = var.instance_count
+
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = var.instance_type
   subnet_id              = resource.aws_subnet.esys-entropy.id
@@ -85,10 +92,6 @@ resource "aws_instance" "esys-entropy" {
   key_name               = "Ephemeral"
 }
 
-output "dns" {
-  value = resource.aws_instance.esys-entropy.public_dns
-}
-
-output "ip" {
-  value = resource.aws_instance.esys-entropy.public_ip
+output "instances" {
+  value = zipmap(resource.aws_instance.esys-entropy[*].public_ip, resource.aws_instance.esys-entropy[*].public_dns)
 }
