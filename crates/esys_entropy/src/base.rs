@@ -86,7 +86,7 @@ impl Base {
         let mut ingress = mpsc::unbounded_channel();
         let handle = BaseHandle {
             ingress: ingress.0,
-            query_resource: Arc::new(Semaphore::new(100)),
+            query_resource: Arc::new(Semaphore::new(1)),
         };
         let name = name.to_string();
         let event_loop = spawn(async move {

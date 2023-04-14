@@ -205,7 +205,7 @@ impl App {
                 }
                 AppEvent::Rpc(_) => {} // do anything?
 
-                AppEvent::ClientInvite => self.client_invite(),
+                AppEvent::ClientInvite => self.client_invite().await,
                 AppEvent::ClientPut(data, channel) => {
                     assert!(self.put_chunks.is_none());
                     self.put_chunks = Some(channel);
@@ -263,10 +263,10 @@ impl App {
             let (chunk_hash, chunk) = task.instrument(encode_span.clone()).await.unwrap();
             self.client_chunks.insert(chunk_hash, chunk);
         }
-        self.client_invite();
+        self.client_invite().await;
     }
 
-    fn client_invite(&mut self) {
+    async fn client_invite(&mut self) {
         for (chunk_hash, chunk) in &mut self.client_chunks {
             assert!(chunk.indexes.len() < self.config.fragment_n);
             let prev_index = chunk.index;
@@ -274,6 +274,7 @@ impl App {
             chunk.index += (((self.config.fragment_n - chunk.indexes.len()) as f32) * 1.2) as u32;
             // doing eval in a good network so skip retry old indexes
             tracing::debug!(index = ?(prev_index..chunk.index), "invite chunk {chunk_hash:02x?}");
+            let mut tasks = Vec::new();
             for index in prev_index..chunk.index {
                 if chunk.indexes.contains_key(&index) {
                     continue;
@@ -289,13 +290,19 @@ impl App {
                         Default::default(),
                     )],
                 });
-                spawn(Self::invite_index_task(
+                let task = spawn(Self::invite_index_task(
                     Self::fragment_hash(chunk_hash, index),
                     self.base.clone(),
                     self.config.invite_count,
                     request,
                     PeerId::from_public_key(&self.keypair.public()),
                 ));
+                tasks.push(task);
+            }
+            // partially sync here, the point to point communication could happen concurrent to inviting next chunk
+            // mostly for engineering reason
+            for task in tasks {
+                task.await.unwrap();
             }
         }
 

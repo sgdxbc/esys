@@ -444,7 +444,8 @@ fn main() {
 
     // churn rate vs. repair traffic
     // kademlia
-    for churn_rate in [0., 1., 2., 3., 4., 5., 6., 7., 8.] {
+    let churn_rates = [0.00001, 1., 2., 3., 4., 5., 6., 7., 8.];
+    for churn_rate in churn_rates {
         config.churn_rate = churn_rate;
         systems.extend(
             repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
@@ -462,7 +463,7 @@ fn main() {
     };
     for cache_sec in [0, 6 * 3600, 12 * 3600, 24 * 3600, 48 * 3600] {
         config.cache_sec = cache_sec;
-        for churn_rate in [0., 1., 2., 3., 4., 5., 6., 7., 8.] {
+        for churn_rate in churn_rates {
             config.churn_rate = churn_rate;
             config.watermark_sec =
                 (365. * 86400. / config.churn_rate / config.fragment_n as f32) as _;
