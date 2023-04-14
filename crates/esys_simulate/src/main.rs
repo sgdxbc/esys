@@ -443,15 +443,46 @@ fn main() {
     let mut systems = Vec::new();
 
     // churn rate vs. repair traffic
+    // let churn_rates = [0.00001, 1., 2., 3., 4., 5., 6., 7., 8.];
+    // // kademlia
+    // for churn_rate in churn_rates {
+    //     config.churn_rate = churn_rate;
+    //     systems.extend(
+    //         repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
+    //     );
+    // }
+    // // entropy
+    // config = Config {
+    //     chunk_n: 100,
+    //     chunk_k: 80,
+    //     fragment_n: 500,
+    //     fragment_k: 200,
+    //     cache_sec: 0,
+    //     ..config
+    // };
+    // for cache_sec in [0, 6 * 3600, 12 * 3600, 24 * 3600, 48 * 3600] {
+    //     config.cache_sec = cache_sec;
+    //     for churn_rate in churn_rates {
+    //         config.churn_rate = churn_rate;
+    //         config.watermark_sec =
+    //             (365. * 86400. / config.churn_rate / config.fragment_n as f32) as _;
+    //         systems.extend(
+    //             repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
+    //         );
+    //     }
+    // }
+
+    // object count vs. repair traffic
+    config.churn_rate = 4.;
+    config.duration = 1;
+    let object_counts = [1, 10, 100, 1000];
     // kademlia
-    let churn_rates = [0.00001, 1., 2., 3., 4., 5., 6., 7., 8.];
-    for churn_rate in churn_rates {
-        config.churn_rate = churn_rate;
+    for object_count in object_counts {
+        config.object_count = object_count;
         systems.extend(
             repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
         );
     }
-
     // entropy
     config = Config {
         chunk_n: 100,
@@ -461,12 +492,11 @@ fn main() {
         cache_sec: 0,
         ..config
     };
+    config.watermark_sec = (365. * 86400. / config.churn_rate / config.fragment_n as f32) as _;
     for cache_sec in [0, 6 * 3600, 12 * 3600, 24 * 3600, 48 * 3600] {
         config.cache_sec = cache_sec;
-        for churn_rate in churn_rates {
-            config.churn_rate = churn_rate;
-            config.watermark_sec =
-                (365. * 86400. / config.churn_rate / config.fragment_n as f32) as _;
+        for object_count in object_counts {
+            config.object_count = object_count;
             systems.extend(
                 repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
             );

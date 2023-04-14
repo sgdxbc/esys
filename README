@@ -27,7 +27,7 @@ Start evaluation
 $ git submodule init
 $ terraform -chdir=crates/esys_entropy/terraform init
 $ terraform -chdir=crates/esys_entropy/terraform apply
-$ ansible-playbook -i inventory.ini crates/esys_entropy/playbook.yml
+$ ansible-playbook -i crates/esys_entropy/terraform/inventory.ini crates/esys_entropy/playbook.yml
 ```
 
 [Work in progress: pipe output CSV data into plot script]
@@ -41,11 +41,17 @@ $ terraform -chdir=crates/esys_entropy/terraform destroy
 
 Reproduce Evaluation of Simulation
 
-Modify `crates/esys_simulate/src/main.rs` according to desired simulation configuration, then run
+Uncomment the desired evaluation setup in `crates/esys_simulate/src/main.rs` then run
 ```
-$ cargo run -r -q --bin esys_simulate > {prefix}-$(date +%s).csv
+$ terraform -chdir=crates/esys_simulate/terraform init
+$ terraform -chdir=crates/esys_simulate/terraform apply
+$ ansible-playbook -i crates/esys_simulate/terraform/invertory.ini crates/esys_simulate/playbook.yml \
+    -e prefix=<evaluation name>
 ```
 
-Plot the results with `notebooks` scripts. Each script picks up the data files whose prefix matches its own file name.
-Since the result format is universal, all possible simulation configuration should be able to plot by all scripts, but
-some combinations make more sense than the others.
+Plot the results with `notebooks/<evaluation name>.ipynb`.
+
+Clean up
+```
+$ terraform -chdir=crates/esys_simulate/terraform destroy
+```
