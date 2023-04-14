@@ -444,14 +444,10 @@ fn main() {
 
     // churn rate vs. repair traffic
     // kademlia
-    for churn_rate in [0.5, 1., 2., 4.] {
+    for churn_rate in [0., 1., 2., 3., 4., 5., 6., 7., 8.] {
         config.churn_rate = churn_rate;
         systems.extend(
-            repeat_with(|| {
-                let mut rng = StdRng::from_rng(&mut seeder).unwrap();
-                (System::new(config.clone(), &mut rng), rng)
-            })
-            .take(10),
+            repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
         );
     }
 
@@ -466,16 +462,12 @@ fn main() {
     };
     for cache_sec in [0, 6 * 3600, 12 * 3600, 24 * 3600, 48 * 3600] {
         config.cache_sec = cache_sec;
-        for churn_rate in [0.5, 1., 2., 4.] {
+        for churn_rate in [0., 1., 2., 3., 4., 5., 6., 7., 8.] {
             config.churn_rate = churn_rate;
             config.watermark_sec =
                 (365. * 86400. / config.churn_rate / config.fragment_n as f32) as _;
             systems.extend(
-                repeat_with(|| {
-                    let mut rng = StdRng::from_rng(&mut seeder).unwrap();
-                    (System::new(config.clone(), &mut rng), rng)
-                })
-                .take(10),
+                repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
             );
         }
     }
@@ -485,22 +477,24 @@ fn main() {
         fragment_n,fragment_k,cache_sec,targeted_count,data_lost,targeted,repair"
     );
 
-    systems.into_par_iter().for_each(|(mut system, rng)| {
+    systems.into_par_iter().for_each(|(config, mut rng)| {
+        eprintln!("{config:?}");
+        let mut system = System::new(config, &mut rng);
         system.run(rng);
         eprintln!("{:?}", system.stats);
         println!(
             "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-            config.churn_rate,
-            config.node_count,
-            config.duration,
-            config.faulty_rate,
-            config.object_count,
-            config.chunk_n,
-            config.chunk_k,
-            config.fragment_n,
-            config.fragment_k,
-            config.cache_sec,
-            config.targeted_count,
+            system.config.churn_rate,
+            system.config.node_count,
+            system.config.duration,
+            system.config.faulty_rate,
+            system.config.object_count,
+            system.config.chunk_n,
+            system.config.chunk_k,
+            system.config.fragment_n,
+            system.config.fragment_k,
+            system.config.cache_sec,
+            system.config.targeted_count,
             system.stats.data_lost,
             system.stats.targeted,
             system.stats.repair

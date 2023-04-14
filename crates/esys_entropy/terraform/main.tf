@@ -92,5 +92,5 @@ resource "local_file" "inventory" {
       region-4      = module.region-4.instances,
       region-5      = module.region-5.instances,
   })
-  filename = "../../../inventory.ini"
+  filename = "${path.module}/inventory.ini"
 }
