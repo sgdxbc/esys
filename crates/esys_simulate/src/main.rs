@@ -57,6 +57,7 @@ struct Config {
     allow_data_lost: bool,
     targeted_count: u32,
     cache_sec: u32,
+    watermark_sec: u32,
 }
 
 #[derive(Debug)]
@@ -418,57 +419,91 @@ impl Config {
 }
 
 fn main() {
-    let config = Config {
-        churn_rate: 2.,
+    const INDEFINITE: u32 = u32::MAX;
+
+    let mut config = Config {
+        churn_rate: f32::INFINITY,
         node_count: 100000,
         duration: 10,
         faulty_rate: 0.,
         object_count: 1,
 
-        // chunk_n: 100,
-        // chunk_k: 80,
-        // fragment_n: 500,
-        // fragment_k: 200,
-        // cache_sec: 0,
-        //
-        // kademlia setup, use with disabled watermark increment
         chunk_n: 1,
         chunk_k: 1,
         fragment_n: 625,
         fragment_k: 200,
-        cache_sec: 365 * 86400 * 100, // traffic equivalent to always cache hit
-        //
+        cache_sec: INDEFINITE, // traffic equivalent to always cache hit
+        watermark_sec: INDEFINITE,
+
         allow_data_lost: true,
         targeted_count: 0,
     };
 
+    let mut seeder = StdRng::seed_from_u64(3141592653589793238);
+    let mut systems = Vec::new();
+
+    // churn rate vs. repair traffic
+    // kademlia
+    for churn_rate in [0.5, 1., 2., 4.] {
+        config.churn_rate = churn_rate;
+        systems.extend(
+            repeat_with(|| {
+                let mut rng = StdRng::from_rng(&mut seeder).unwrap();
+                (System::new(config.clone(), &mut rng), rng)
+            })
+            .take(10),
+        );
+    }
+
+    // entropy
+    config = Config {
+        chunk_n: 100,
+        chunk_k: 80,
+        fragment_n: 500,
+        fragment_k: 200,
+        cache_sec: 0,
+        ..config
+    };
+    for cache_sec in [0, 6 * 3600, 12 * 3600, 24 * 3600, 48 * 3600] {
+        config.cache_sec = cache_sec;
+        for churn_rate in [0.5, 1., 2., 4.] {
+            config.churn_rate = churn_rate;
+            config.watermark_sec =
+                (365. * 86400. / config.churn_rate / config.fragment_n as f32) as _;
+            systems.extend(
+                repeat_with(|| {
+                    let mut rng = StdRng::from_rng(&mut seeder).unwrap();
+                    (System::new(config.clone(), &mut rng), rng)
+                })
+                .take(10),
+            );
+        }
+    }
+
     println!(
         "churn_rate,node_count,duration,faulty_rate,object_count,chunk_n,chunk_k,\
-        fragment_n,fragment_k,targeted_count,data_lost,targeted,repair"
+        fragment_n,fragment_k,cache_sec,targeted_count,data_lost,targeted,repair"
     );
 
-    let mut seeder = StdRng::seed_from_u64(3141592653589793238);
-    Vec::from_iter(repeat_with(|| StdRng::from_rng(&mut seeder).unwrap()).take(16))
-        .into_par_iter()
-        .for_each(|mut rng| {
-            let mut system = System::new(config.clone(), &mut rng);
-            system.run(rng);
-            // println!("{:?}", system.stats);
-            println!(
-                "{},{},{},{},{},{},{},{},{},{},{},{},{}",
-                config.churn_rate,
-                config.node_count,
-                config.duration,
-                config.faulty_rate,
-                config.object_count,
-                config.chunk_n,
-                config.chunk_k,
-                config.fragment_n,
-                config.fragment_k,
-                config.targeted_count,
-                system.stats.data_lost,
-                system.stats.targeted,
-                system.stats.repair
-            );
-        })
+    systems.into_par_iter().for_each(|(mut system, rng)| {
+        system.run(rng);
+        eprintln!("{:?}", system.stats);
+        println!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            config.churn_rate,
+            config.node_count,
+            config.duration,
+            config.faulty_rate,
+            config.object_count,
+            config.chunk_n,
+            config.chunk_k,
+            config.fragment_n,
+            config.fragment_k,
+            config.cache_sec,
+            config.targeted_count,
+            system.stats.data_lost,
+            system.stats.targeted,
+            system.stats.repair
+        );
+    })
 }

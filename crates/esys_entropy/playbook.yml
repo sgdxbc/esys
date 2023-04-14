@@ -1,5 +1,5 @@
 ---
-- name: Common setup
+- name: Common Setup
   hosts: all
   tasks:
   - name: Compile artifact
@@ -19,13 +19,13 @@
       limit_type: soft
       limit_item: nofile
       value: 1048576
-- name: Start service peer
+- name: Start Service Peer
   hosts: service
   tasks:
   - ansible.builtin.shell: >
       tmux new-session -d -s esys 
       "./esys_entropy --ip {{ inventory_hostname }} --bootstrap-service || read _"
-- name: Start normal peers
+- name: Start Normal Peers
   hosts: normal
   tasks:
   - ansible.builtin.shell: >

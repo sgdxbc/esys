@@ -1,0 +1,24 @@
+---
+- name: Main
+  hosts: all
+  tasks:
+  - name: Compile Artifact
+    local_action:
+      ansible.builtin.shell cargo build --release --bin esys_simulate
+    run_once: true
+  - name: Copy Compiled Artifact
+    ansible.builtin.copy:
+      src: ../../target/release/esys_simulate
+      dest: .
+      mode: preserve
+  - name: Run
+    ansible.builtin.shell: ./esys_simulate > {{ prefix }}.csv
+  - name: Fetch Result
+    ansible.builtin.fetch:
+      src: "{{ prefix }}.csv"
+      dest: "../../{{ prefix }}_{{ ansible_date_time.epoch }}.csv"
+      flat: true
+  - name: Clean Remote
+    ansible.builtin.file:
+      path: "{{ prefix }}.csv"
+      state: absent
