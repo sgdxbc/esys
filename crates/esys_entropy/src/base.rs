@@ -11,7 +11,7 @@ use libp2p::{
     },
     multiaddr,
     multihash::Multihash,
-    request_response::ProtocolSupport,
+    request_response::{ProtocolSupport, ResponseChannel},
     swarm::{
         AddressScore, NetworkBehaviour as NetworkBehavior, SwarmBuilder,
         SwarmEvent::{self, Behaviour as Behavior},
@@ -23,7 +23,7 @@ use libp2p::{
 use rand::Rng;
 use tokio::{
     select, spawn,
-    sync::{mpsc, oneshot, Notify, Semaphore},
+    sync::{mpsc, oneshot, Notify},
     task::JoinHandle,
 };
 use tracing::{
@@ -50,7 +50,6 @@ impl Base {
 #[derive(Clone)]
 pub struct BaseHandle {
     ingress: mpsc::UnboundedSender<IngressTask>,
-    query_resource: Arc<Semaphore>,
 }
 
 type IngressTask = Box<dyn FnOnce(&mut Swarm<Base>, &mut Vec<AppObserver>) + Send>;
@@ -84,10 +83,7 @@ impl Base {
         };
         let mut swarm = SwarmBuilder::with_tokio_executor(transport, app, id).build();
         let mut ingress = mpsc::unbounded_channel();
-        let handle = BaseHandle {
-            ingress: ingress.0,
-            query_resource: Arc::new(Semaphore::new(1)),
-        };
+        let handle = BaseHandle { ingress: ingress.0 };
         let name = name.to_string();
         let event_loop = spawn(async move {
             tracing::trace!("launch app event looop");
@@ -183,7 +179,7 @@ impl BaseHandle {
             move |event, swarm| {
                 if let SwarmEvent::NewListenAddr { address, .. } = event.as_ref().unwrap() {
                     if let Some(address) = into_external(address) {
-                        tracing::info!(peer_id = %swarm.local_peer_id(), %address, "add external");
+                        tracing::debug!(peer_id = %swarm.local_peer_id(), %address, "add external");
                         swarm.add_external_address(address, AddressScore::Infinite);
                         notify.notify_one();
                     }
@@ -215,8 +211,12 @@ impl BaseHandle {
         drop(s);
     }
 
-    pub async fn cancel_queries(&self) {
-        //
+    pub fn cancel_queries(&self) {
+        self.ingress(|swarm| {
+            for mut query in swarm.behaviour_mut().kad.iter_queries_mut() {
+                query.finish();
+            }
+        });
     }
 
     pub async fn boostrap(&self, service: Multiaddr) {
@@ -361,7 +361,6 @@ impl BaseHandle {
     pub async fn query(&self, key: Multihash, n: usize) -> Vec<(PeerId, Option<Multiaddr>)> {
         let backoff = rand::thread_rng().gen_range(Duration::ZERO..Duration::from_millis(1 * 1000));
         tokio::time::sleep(backoff).await;
-        let _guard = self.query_resource.acquire().await.unwrap();
         let find_id = self
             .ingress_wait(move |swarm| swarm.behaviour_mut().kad.get_closest_peers(key))
             .await;
@@ -412,6 +411,19 @@ impl BaseHandle {
             peers.push((peer_id, task.await.unwrap()));
         }
         peers
+    }
+
+    pub fn response_ok(&self, channel: ResponseChannel<crate::rpc::proto::Response>) {
+        self.ingress(move |swarm| {
+            swarm
+                .behaviour_mut()
+                .rpc
+                .send_response(
+                    channel,
+                    crate::rpc::proto::Response::from(crate::rpc::proto::Ok {}),
+                )
+                .unwrap()
+        })
     }
 }
 

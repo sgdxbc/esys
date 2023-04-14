@@ -26,11 +26,11 @@ struct Cli {
     #[clap(short, default_value_t = 1)]
     n: usize,
 
-    #[clap(long, default_value_t = 100)]
+    #[clap(long, default_value_t = 40)]
     chunk_k: usize,
-    #[clap(long, default_value_t = 100)]
+    #[clap(long, default_value_t = 50)]
     chunk_n: usize,
-    #[clap(long, default_value_t = 64)]
+    #[clap(long, default_value_t = 40)]
     fragment_k: usize,
     #[clap(long, default_value_t = 100)]
     fragment_n: usize,
@@ -98,7 +98,10 @@ async fn main() {
             let mut data = vec![0; config.fragment_size * config.fragment_k * config.chunk_k];
             let mut app = App::new(base.handle, base.keypair, base.addr, config);
             let control = app.control();
-            let app_loop = spawn(async move { app.serve().await });
+            let app_loop = spawn(async move {
+                app.serve().await;
+                app
+            });
             thread_rng().fill_bytes(&mut data);
             async {
                 let mut put_chunks = control.put(data);
@@ -109,7 +112,8 @@ async fn main() {
             .instrument(info_span!("put"))
             .await;
             control.close();
-            app_loop.await.unwrap();
+            let app = app_loop.await.unwrap();
+            app.base.cancel_queries();
             base.event_loop.await.unwrap();
         } else {
             let mut tasks = Vec::new();
@@ -118,10 +122,10 @@ async fn main() {
                     start_base(&cli, format!("normal-{i}")).await,
                     // wait for the farest peers
                     // Duration::ZERO..Duration::from_millis(20 * 1000),
-                    Duration::ZERO..Duration::from_millis(5 * 1000),
+                    Duration::from_millis(2 * 1000)..Duration::from_millis(10 * 1000),
                     // up to 20s random delay diff + up to 40s bootstrap latency
                     // Duration::from_millis(80 * 1000),
-                    Duration::from_millis(30 * 1000),
+                    Duration::from_millis(25 * 1000),
                 ));
             }
 
@@ -129,7 +133,7 @@ async fn main() {
             for task in tasks {
                 bases.push(task.await.unwrap());
             }
-            tracing::info!("peers register done");
+            tracing::info!("READY");
 
             let mut base_loops = Vec::new();
             let mut app_controls = Vec::new();

@@ -32,4 +32,4 @@
       tmux new-session -d -s esys 
       "./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 400 || read _"
     environment:
-      RUST_LOG: esys_entropy=debug
+      RUST_LOG: esys_entropy=info
