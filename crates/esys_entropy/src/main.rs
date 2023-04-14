@@ -4,7 +4,7 @@ use std::{
     ops::{ControlFlow, Range},
     pin::pin,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clap::Parser;
@@ -51,6 +51,8 @@ struct Cli {
 
     #[clap(long)]
     kademlia: bool,
+    #[clap(long, default_value_t = 1)]
+    repeat: usize,
 }
 
 #[tokio::main]
@@ -103,104 +105,113 @@ async fn main() {
             };
 
         if cli.put {
-            let base = init_base(
-                start_base(&cli, "put").await,
-                Duration::ZERO..Duration::from_millis(1),
-                Duration::ZERO,
-            )
-            .await
-            .unwrap();
-            let mut data = vec![0; config.fragment_size * config.fragment_k * config.chunk_k];
-            thread_rng().fill_bytes(&mut data);
-            let mut chunks = Vec::new();
-            let mut kademlia_keys = Vec::new();
+            eprintln!("chunk_k,chunk_n,fragment_k,fragment_n,op,latency");
 
-            if cli.kademlia {
-                // let mut put_ids = HashSet::new();
-                async {
-                    for fragment in data.chunks_exact(config.fragment_size) {
-                        let fragment = fragment.to_vec();
-                        let key = Code::Sha2_256.digest(&fragment);
-                        kademlia_keys.push(key);
-                        let put_id = base
-                            .handle
-                            .ingress_wait(move |swarm| {
-                                let record = Record::new(key, fragment);
-                                swarm
-                                    .behaviour_mut()
-                                    .kad
-                                    .put_record(
-                                        record,
-                                        libp2p::kad::Quorum::N(3.try_into().unwrap()),
-                                    )
-                                    .unwrap()
-                            })
-                            .await;
-                        // put_ids.insert(put_id);
-                        base.handle
-                            .subscribe(move |event, _| match event.as_ref().unwrap() {
-                                SwarmEvent::Behaviour(BaseEvent::Kad(
-                                    // TODO check result
-                                    KademliaEvent::OutboundQueryProgressed {
-                                        id, result: _, ..
-                                    },
-                                )) => {
-                                    // put_ids.remove(id);
-                                    // if put_ids.is_empty() {
-                                    if *id == put_id {
-                                        ControlFlow::Break(())
-                                    } else {
-                                        ControlFlow::Continue(())
-                                    }
-                                }
-                                _ => ControlFlow::Continue(()),
-                            })
-                            .await;
-                    }
-                }
-                .instrument(info_span!("put"))
+            for _ in 0..cli.repeat {
+                let base = init_base(
+                    start_base(&cli, "put").await,
+                    Duration::ZERO..Duration::from_millis(1),
+                    Duration::ZERO,
+                )
                 .await
-            } else {
-                let mut app = App::new(base.handle, base.keypair, base.addr, config.clone());
-                let control = app.control();
-                let _app_loop = spawn(async move {
-                    app.serve().await;
-                    app
-                });
-                async {
-                    let mut put_chunks = control.put(data);
-                    while let Some((chunk_index, chunk_hash, members)) = put_chunks.recv().await {
-                        tracing::info!("put chunk {chunk_hash:02x?}");
-                        chunks.push((chunk_index, chunk_hash, members));
-                    }
-                }
-                .instrument(info_span!("put"))
-                .await;
-                control.close();
-                // let app = app_loop.await.unwrap();
-                // drop(app.base);
-            }
+                .unwrap();
+                let mut data = vec![0; config.fragment_size * config.fragment_k * config.chunk_k];
+                thread_rng().fill_bytes(&mut data);
+                let mut chunks = Vec::new();
+                let mut kademlia_keys = Vec::new();
 
-            sleep(Duration::from_secs(5)).await; // so putter have sent out all fragments
-            let base = init_base(
-                start_base(&cli, "get").await,
-                Duration::ZERO..Duration::from_millis(1),
-                Duration::ZERO,
-            )
-            .await
-            .unwrap();
-
-            if cli.kademlia {
-                async {
-                    for key in kademlia_keys {
-                        let get_id = base
-                            .handle
-                            .ingress_wait(move |swarm| {
-                                swarm.behaviour_mut().kad.get_record(key.into())
-                            })
-                            .await;
-                        let _fragment =
+                let put_start = Instant::now();
+                if cli.kademlia {
+                    // let mut put_ids = HashSet::new();
+                    async {
+                        for fragment in data.chunks_exact(config.fragment_size) {
+                            let fragment = fragment.to_vec();
+                            let key = Code::Sha2_256.digest(&fragment);
+                            kademlia_keys.push(key);
+                            let put_id = base
+                                .handle
+                                .ingress_wait(move |swarm| {
+                                    let record = Record::new(key, fragment);
+                                    swarm
+                                        .behaviour_mut()
+                                        .kad
+                                        .put_record(
+                                            record,
+                                            libp2p::kad::Quorum::N(3.try_into().unwrap()),
+                                        )
+                                        .unwrap()
+                                })
+                                .await;
+                            // put_ids.insert(put_id);
                             base.handle
+                                .subscribe(move |event, _| match event.as_ref().unwrap() {
+                                    SwarmEvent::Behaviour(BaseEvent::Kad(
+                                        // TODO check result
+                                        KademliaEvent::OutboundQueryProgressed {
+                                            id,
+                                            result: _,
+                                            ..
+                                        },
+                                    )) => {
+                                        // put_ids.remove(id);
+                                        // if put_ids.is_empty() {
+                                        if *id == put_id {
+                                            ControlFlow::Break(())
+                                        } else {
+                                            ControlFlow::Continue(())
+                                        }
+                                    }
+                                    _ => ControlFlow::Continue(()),
+                                })
+                                .await;
+                        }
+                    }
+                    .instrument(info_span!("put"))
+                    .await
+                } else {
+                    let mut app = App::new(base.handle, base.keypair, base.addr, config.clone());
+                    let control = app.control();
+                    let _app_loop = spawn(async move {
+                        app.serve().await;
+                        app
+                    });
+                    async {
+                        let mut put_chunks = control.put(data);
+                        while let Some((chunk_index, chunk_hash, members)) = put_chunks.recv().await
+                        {
+                            tracing::info!("put chunk {chunk_hash:02x?}");
+                            chunks.push((chunk_index, chunk_hash, members));
+                        }
+                    }
+                    .instrument(info_span!("put"))
+                    .await;
+                    control.close();
+                    // let app = app_loop.await.unwrap();
+                    // drop(app.base);
+                }
+                let put_latency = Instant::now() - put_start;
+
+                sleep(Duration::from_secs(5)).await; // so putter have sent out all fragments
+                let base = init_base(
+                    start_base(&cli, "get").await,
+                    Duration::ZERO..Duration::from_millis(1),
+                    Duration::ZERO,
+                )
+                .await
+                .unwrap();
+
+                let get_start = Instant::now();
+                if cli.kademlia {
+                    async {
+                        for key in kademlia_keys {
+                            let get_id = base
+                                .handle
+                                .ingress_wait(move |swarm| {
+                                    swarm.behaviour_mut().kad.get_record(key.into())
+                                })
+                                .await;
+                            let _fragment = base
+                                .handle
                                 .subscribe(move |event, swarm| match event.as_ref().unwrap() {
                                     SwarmEvent::Behaviour(BaseEvent::Kad(
                                         KademliaEvent::OutboundQueryProgressed {
@@ -228,57 +239,72 @@ async fn main() {
                                     _ => ControlFlow::Continue(()),
                                 })
                                 .await;
-                    }
-                }
-                .instrument(info_span!("get"))
-                .await
-            } else {
-                async {
-                    let mut app = App::new(base.handle, base.keypair, base.addr, config.clone());
-                    let control = app.control();
-                    let _app_loop = spawn(async move {
-                        app.serve().await;
-                        app
-                    });
-                    let mut tasks = Vec::new();
-                    for (chunk_index, chunk_hash, members) in
-                        chunks.into_iter().take(config.chunk_k + 1)
-                    {
-                        let mut get_fragments = control.get_with_members(&chunk_hash, members);
-                        let mut decoder = WirehairDecoder::new(
-                            (config.fragment_size * config.fragment_k) as _,
-                            config.fragment_size as _,
-                        );
-                        let task = spawn(async move {
-                            while let Some((id, fragment)) = get_fragments.recv().await {
-                                tracing::debug!("get fragment {chunk_index} {id}");
-                                let recovered = decoder.decode(id, &fragment).unwrap();
-                                if recovered {
-                                    break;
-                                }
-                            }
-                            let mut chunk = vec![0; decoder.message_bytes as _];
-                            decoder.recover(&mut chunk).unwrap();
-                            tracing::info!("get chunk {chunk_index}");
-                            (chunk_index, chunk)
-                        });
-                        tasks.push(task);
-                    }
-                    let mut decoder = WirehairDecoder::new(
-                        (config.fragment_size * config.fragment_k * config.chunk_k) as _,
-                        (config.fragment_size * config.fragment_k) as _,
-                    );
-                    for task in tasks {
-                        let (chunk_index, chunk) = task.await.unwrap();
-                        if decoder.decode(chunk_index, &chunk).unwrap() {
-                            break;
                         }
                     }
-                    let mut buffer = vec![0; decoder.message_bytes as _];
-                    decoder.recover(&mut buffer).unwrap();
+                    .instrument(info_span!("get"))
+                    .await
+                } else {
+                    async {
+                        let mut app =
+                            App::new(base.handle, base.keypair, base.addr, config.clone());
+                        let control = app.control();
+                        let _app_loop = spawn(async move {
+                            app.serve().await;
+                            app
+                        });
+                        let mut tasks = Vec::new();
+                        for (chunk_index, chunk_hash, members) in
+                            chunks.into_iter().take(config.chunk_k + 1)
+                        {
+                            let mut get_fragments = control.get_with_members(&chunk_hash, members);
+                            let mut decoder = WirehairDecoder::new(
+                                (config.fragment_size * config.fragment_k) as _,
+                                config.fragment_size as _,
+                            );
+                            let task = spawn(async move {
+                                while let Some((id, fragment)) = get_fragments.recv().await {
+                                    tracing::debug!("get fragment {chunk_index} {id}");
+                                    let recovered = decoder.decode(id, &fragment).unwrap();
+                                    if recovered {
+                                        break;
+                                    }
+                                }
+                                let mut chunk = vec![0; decoder.message_bytes as _];
+                                decoder.recover(&mut chunk).unwrap();
+                                tracing::info!("get chunk {chunk_index}");
+                                (chunk_index, chunk)
+                            });
+                            tasks.push(task);
+                        }
+                        let mut decoder = WirehairDecoder::new(
+                            (config.fragment_size * config.fragment_k * config.chunk_k) as _,
+                            (config.fragment_size * config.fragment_k) as _,
+                        );
+                        for task in tasks {
+                            let (chunk_index, chunk) = task.await.unwrap();
+                            if decoder.decode(chunk_index, &chunk).unwrap() {
+                                break;
+                            }
+                        }
+                        let mut buffer = vec![0; decoder.message_bytes as _];
+                        decoder.recover(&mut buffer).unwrap();
+                    }
+                    .instrument(info_span!("get"))
+                    .await;
                 }
-                .instrument(info_span!("get"))
-                .await;
+                let get_latency = Instant::now() - get_start;
+
+                for (op, latency) in [("put", put_latency), ("get", get_latency)] {
+                    eprintln!(
+                        "{},{},{},{},{},{}",
+                        config.chunk_k,
+                        config.chunk_n,
+                        config.fragment_k,
+                        config.fragment_n,
+                        op,
+                        latency.as_secs_f32()
+                    );
+                }
             }
         } else {
             let mut tasks = Vec::new();
