@@ -120,13 +120,15 @@ impl Base {
 
 impl BaseHandle {
     pub fn ingress(&self, action: impl FnOnce(&mut Swarm<Base>) + Send + Sync + 'static) {
-        if self
-            .ingress
+        // if
+        self.ingress
             .send(Box::new(|swarm, _| action(swarm)))
-            .is_err()
-        {
-            tracing::warn!("fail to ingress");
-        }
+            .map_err(|_| ())
+            .unwrap();
+        //     .is_err()
+        // {
+        //     tracing::warn!("fail to ingress");
+        // }
     }
 
     pub fn ingress_wait<T: Send + 'static>(

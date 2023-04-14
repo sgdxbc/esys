@@ -2,6 +2,7 @@ use std::{mem::take, net::Ipv4Addr, ops::Range, pin::pin, sync::Arc, time::Durat
 
 use clap::Parser;
 use esys_entropy::{App, AppConfig, Base, BaseHandle};
+use esys_wirehair::WirehairDecoder;
 use libp2p::{
     bandwidth::BandwidthSinks,
     core::upgrade::Version::V1,
@@ -97,17 +98,19 @@ async fn main() {
             .await
             .unwrap();
             let mut data = vec![0; config.fragment_size * config.fragment_k * config.chunk_k];
-            let mut app = App::new(base.handle, base.keypair, base.addr, config);
+            let mut app = App::new(base.handle, base.keypair, base.addr, config.clone());
             let control = app.control();
             let app_loop = spawn(async move {
                 app.serve().await;
                 app
             });
             thread_rng().fill_bytes(&mut data);
+            let mut chunks = Vec::new();
             async {
                 let mut put_chunks = control.put(data);
-                while let Some(chunk_hash) = put_chunks.recv().await {
+                while let Some((chunk_index, chunk_hash, members)) = put_chunks.recv().await {
                     tracing::info!("put chunk {chunk_hash:02x?}");
+                    chunks.push((chunk_index, chunk_hash, members));
                 }
             }
             .instrument(info_span!("put"))
@@ -118,6 +121,61 @@ async fn main() {
             // app.base.cancel_observers();
             drop(app.base);
             // base.event_loop.await.unwrap();
+
+            sleep(Duration::from_secs(5)).await; // so putter have sent out all fragments
+            async {
+                let base = init_base(
+                    start_base(&cli, "get").await,
+                    Duration::ZERO..Duration::from_millis(1),
+                    Duration::ZERO,
+                )
+                .await
+                .unwrap();
+                let mut app = App::new(base.handle, base.keypair, base.addr, config.clone());
+                let control = app.control();
+                let _app_loop = spawn(async move {
+                    app.serve().await;
+                    app
+                });
+                let mut tasks = Vec::new();
+                for (chunk_index, chunk_hash, members) in
+                    chunks.into_iter().take(config.chunk_k + 1)
+                {
+                    let mut get_fragments = control.get_with_members(&chunk_hash, members);
+                    let mut decoder = WirehairDecoder::new(
+                        (config.fragment_size * config.fragment_k) as _,
+                        config.fragment_size as _,
+                    );
+                    let task = spawn(async move {
+                        while let Some((id, fragment)) = get_fragments.recv().await {
+                            tracing::debug!("get fragment {chunk_index} {id}");
+                            let recovered = decoder.decode(id, &fragment).unwrap();
+                            if recovered {
+                                break;
+                            }
+                        }
+                        let mut chunk = vec![0; decoder.message_bytes as _];
+                        decoder.recover(&mut chunk).unwrap();
+                        tracing::info!("get chunk {chunk_index}");
+                        (chunk_index, chunk)
+                    });
+                    tasks.push(task);
+                }
+                let mut decoder = WirehairDecoder::new(
+                    (config.fragment_size * config.fragment_k * config.chunk_k) as _,
+                    (config.fragment_size * config.fragment_k) as _,
+                );
+                for task in tasks {
+                    let (chunk_index, chunk) = task.await.unwrap();
+                    if decoder.decode(chunk_index, &chunk).unwrap() {
+                        break;
+                    }
+                }
+                let mut buffer = vec![0; decoder.message_bytes as _];
+                decoder.recover(&mut buffer).unwrap();
+            }
+            .instrument(info_span!("get"))
+            .await;
         } else {
             let mut tasks = Vec::new();
             for i in 0..cli.n {

@@ -42,7 +42,8 @@ pub struct App {
 
     client_chunks: HashMap<Multihash, ClientChunk>,
     client_queue: VecDeque<Multihash>,
-    put_chunks: Option<mpsc::UnboundedSender<Multihash>>,
+    put_chunks: Option<mpsc::UnboundedSender<(u32, Multihash, HashMap<PeerId, Member>)>>,
+    get_chunks: HashMap<Multihash, mpsc::UnboundedSender<(u32, Vec<u8>)>>,
 
     config: AppConfig,
 }
@@ -79,7 +80,7 @@ struct Chunk {
 }
 
 #[derive(Debug, Clone)]
-struct Member {
+pub struct Member {
     index: u32,
     addr: Multiaddr,
     proof: Vec<u8>,
@@ -93,6 +94,7 @@ enum Fragment {
 }
 
 struct ClientChunk {
+    chunk_index: u32,
     encoder: WirehairEncoder,
     enter_time_sec: u64,
     index: u32,
@@ -110,7 +112,15 @@ enum AppEvent {
     Invite(Multihash),
 
     ClientInvite(Multihash),
-    ClientPut(Vec<u8>, mpsc::UnboundedSender<Multihash>),
+    ClientPut(
+        Vec<u8>,
+        mpsc::UnboundedSender<(u32, Multihash, HashMap<PeerId, Member>)>,
+    ),
+    ClientGetWithMembers(
+        Multihash,
+        HashMap<PeerId, Member>,
+        mpsc::UnboundedSender<(u32, Vec<u8>)>,
+    ),
 }
 
 impl AppControl {
@@ -118,9 +128,28 @@ impl AppControl {
         self.0.send(AppEvent::Close).unwrap();
     }
 
-    pub fn put(&self, data: Vec<u8>) -> mpsc::UnboundedReceiver<Multihash> {
+    pub fn put(
+        &self,
+        data: Vec<u8>,
+    ) -> mpsc::UnboundedReceiver<(u32, Multihash, HashMap<PeerId, Member>)> {
         let channel = mpsc::unbounded_channel();
         self.0.send(AppEvent::ClientPut(data, channel.0)).unwrap();
+        channel.1
+    }
+
+    pub fn get_with_members(
+        &self,
+        chunk_hash: &Multihash,
+        members: HashMap<PeerId, Member>,
+    ) -> mpsc::UnboundedReceiver<(u32, Vec<u8>)> {
+        let channel = mpsc::unbounded_channel();
+        self.0
+            .send(AppEvent::ClientGetWithMembers(
+                *chunk_hash,
+                members,
+                channel.0,
+            ))
+            .unwrap();
         channel.1
     }
 }
@@ -131,10 +160,11 @@ impl App {
             base,
             control: mpsc::unbounded_channel(),
             chunks: Default::default(),
-            invite_resource: Arc::new(Semaphore::new(100)),
+            invite_resource: Arc::new(Semaphore::new(50)),
             client_chunks: Default::default(),
             client_queue: Default::default(),
             put_chunks: None,
+            get_chunks: Default::default(),
             addr,
             keypair,
             config,
@@ -217,6 +247,10 @@ impl App {
                     self.put_chunks = Some(channel);
                     self.put(data).await;
                 }
+                AppEvent::ClientGetWithMembers(chunk_hash, members, channel) => {
+                    self.get_chunks.insert(chunk_hash, channel);
+                    self.get_with_members(&chunk_hash, members)
+                }
             }
         }
     }
@@ -249,9 +283,11 @@ impl App {
             let outer_encoder = outer_encoder.clone();
             let task = spawn_blocking(move || {
                 let mut buffer = vec![0; fragment_size * fragment_k];
-                outer_encoder.encode(random(), &mut buffer).unwrap();
+                let chunk_index = random();
+                outer_encoder.encode(chunk_index, &mut buffer).unwrap();
                 let chunk_hash = Code::Sha2_256.digest(&buffer);
                 let chunk = ClientChunk {
+                    chunk_index,
                     encoder: WirehairEncoder::new(buffer, fragment_size as _),
                     enter_time_sec: SystemTime::now()
                         .duration_since(UNIX_EPOCH)
@@ -373,6 +409,11 @@ impl App {
                 )
             }));
             let encoder = Arc::new(chunk.encoder);
+            let reply_members = chunk
+                .members
+                .iter()
+                .map(|(id, (member, _))| (*id, member.clone()))
+                .collect();
             for (member, channel) in chunk.members.into_values() {
                 let encoder = encoder.clone();
                 let base = self.base.clone();
@@ -401,7 +442,11 @@ impl App {
                 });
             }
 
-            self.put_chunks.as_ref().unwrap().send(chunk_hash).unwrap();
+            self.put_chunks
+                .as_ref()
+                .unwrap()
+                .send((chunk.chunk_index, chunk_hash, reply_members))
+                .unwrap();
             if self.client_chunks.is_empty() {
                 self.put_chunks = None;
             }
@@ -418,6 +463,21 @@ impl App {
                     self.client_invite(&chunk_hash);
                 }
             }
+        }
+    }
+
+    fn get_with_members(&mut self, chunk_hash: &Multihash, members: HashMap<PeerId, Member>) {
+        let request = proto::Request::from(proto::QueryFragment {
+            chunk_hash: chunk_hash.to_bytes(),
+            member: None,
+        });
+        for (id, member) in members {
+            let addr = member.addr;
+            let request = request.clone();
+            self.base.ingress(move |swarm| {
+                swarm.behaviour_mut().rpc_ensure_address(&id, addr);
+                swarm.behaviour_mut().rpc.send_request(&id, request);
+            });
         }
     }
 
@@ -732,7 +792,34 @@ impl App {
             return;
         }
 
-        let member = message.member.as_ref().unwrap();
+        let Some(member) = message.member.as_ref() else {
+            // client request
+            let chunk = &self.chunks[&chunk_hash];
+            let response = proto::Response::from(proto::QueryFragmentOk {
+                chunk_hash: message.chunk_hash.clone(),
+                fragment: if let Fragment::Complete(fragment) = &chunk.fragment {fragment.clone()} else {
+                    self.base.response_ok(channel);
+                    return;
+                },
+                member: Some(proto::Member::new(
+                    chunk.fragment_index,
+                    &self.keypair.public(),
+                    &self.addr,
+                    chunk.members[&PeerId::from_public_key(&self.keypair.public())]
+                        .proof
+                        .clone(),
+                )),
+                init_members: Default::default(), // not used
+            });
+            self.base.ingress(move |swarm| {
+                swarm
+                    .behaviour_mut()
+                    .rpc
+                    .send_response(channel, response)
+                    .unwrap();
+            });
+            return;
+        };
         let public_key = member.public_key().unwrap();
         if !self.verify(&chunk_hash, member.index, &public_key, &member.proof) {
             //
@@ -772,6 +859,16 @@ impl App {
 
     fn handle_query_fragment_ok(&mut self, message: &proto::QueryFragmentOk) {
         let chunk_hash = message.chunk_hash();
+        if let Some(channel) = self.get_chunks.get(&chunk_hash) {
+            let member = message.member.as_ref().unwrap();
+            let public_key = member.public_key().unwrap();
+            if !self.verify(&chunk_hash, member.index, &public_key, &member.proof) {
+                tracing::warn!("client fail to verify fragment");
+                return;
+            }
+            let _ = channel.send((member.index, message.fragment.clone()));
+            return;
+        }
         if !self.chunks.contains_key(&chunk_hash) {
             //
             return;
@@ -955,10 +1052,12 @@ impl App {
     ) -> bool {
         let mut input = chunk_hash.to_bytes();
         input.extend(&index.to_be_bytes());
-        self.chunks[chunk_hash]
-            .watermark(&self.config)
-            .contains(&index)
-            && public_key.verify(&input, proof)
+        // hack for client get chunk
+        (if let Some(chunk) = self.chunks.get(chunk_hash) {
+            chunk.watermark(&self.config).contains(&index)
+        } else {
+            true
+        }) && public_key.verify(&input, proof)
             && Self::accepted(
                 chunk_hash,
                 index,

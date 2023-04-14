@@ -94,8 +94,8 @@ unsafe impl Sync for WirehairEncoder {}
 #[derive(Debug)]
 pub struct WirehairDecoder {
     raw: *mut WirehairCodecRaw,
-    message_bytes: u64,
-    block_bytes: u32,
+    pub message_bytes: u64,
+    pub block_bytes: u32,
     need_more: bool,
     converted: bool,
 }
