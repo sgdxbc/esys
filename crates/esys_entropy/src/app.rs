@@ -355,8 +355,8 @@ impl App {
             let (_, prev_channel) = chunk.members.remove(&prev_id).unwrap();
             self.base.response_ok(prev_channel);
         }
-        tracing::debug!(id = %member_id, "insert member chunk {chunk_hash:02x?} index {}", member.index);
         chunk.indexes.insert(member.index, public_key);
+        tracing::debug!(id = %member_id, "insert member chunk {chunk_hash:02x?} index {} group size {}", member.index, chunk.indexes.len());
         chunk
             .members
             .insert(member_id, (Member::new(member, false), channel));

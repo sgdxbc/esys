@@ -6,8 +6,8 @@ use libp2p::{
     identify::{self, Behaviour as Identify},
     identity::Keypair,
     kad::{
-        kbucket, record::Key, store::MemoryStore, GetRecordError, GetRecordOk, Kademlia,
-        KademliaEvent, PutRecordError, QueryResult, Quorum, Record,
+        kbucket, record::Key, store::MemoryStore, GetClosestPeersError, GetRecordError,
+        GetRecordOk, Kademlia, KademliaEvent, PutRecordError, QueryResult, Quorum, Record,
     },
     multiaddr,
     multihash::Multihash,
@@ -69,6 +69,12 @@ impl Base {
                 "/entropy/0.1.0".into(),
                 keypair.public(),
             )),
+            // kad: Kademlia::with_config(id, MemoryStore::new(id), {
+            //     let mut config = KademliaConfig::default();
+            //     config.set_max_packet_size(1 << 30);
+            //     config.set_query_timeout(Duration::from_secs(8));
+            //     config
+            // }),
             kad: Kademlia::new(id, MemoryStore::new(id)),
             rpc: crate::rpc::Behavior::new(
                 Default::default(),
@@ -114,10 +120,13 @@ impl Base {
 
 impl BaseHandle {
     pub fn ingress(&self, action: impl FnOnce(&mut Swarm<Base>) + Send + Sync + 'static) {
-        self.ingress
+        if self
+            .ingress
             .send(Box::new(|swarm, _| action(swarm)))
-            .map_err(|_| ())
-            .expect("event loop outlives handle")
+            .is_err()
+        {
+            tracing::warn!("fail to ingress");
+        }
     }
 
     pub fn ingress_wait<T: Send + 'static>(
@@ -211,12 +220,20 @@ impl BaseHandle {
         drop(s);
     }
 
-    pub fn cancel_queries(&self) {
-        self.ingress(|swarm| {
+    pub async fn cancel_queries(&self) {
+        self.ingress_wait(|swarm| {
             for mut query in swarm.behaviour_mut().kad.iter_queries_mut() {
                 query.finish();
             }
-        });
+        })
+        .await;
+    }
+
+    pub fn cancel_observers(&self) {
+        self.ingress
+            .send(Box::new(|_, observers| observers.clear()))
+            .map_err(|_| ())
+            .unwrap();
     }
 
     pub async fn boostrap(&self, service: Multiaddr) {
@@ -344,7 +361,10 @@ impl BaseHandle {
                         Some(Multiaddr::try_from(result.record.value).unwrap())
                     }
                     Err(GetRecordError::NotFound { .. }) => None,
-                    Err(GetRecordError::Timeout { .. }) => unimplemented!(),
+                    Err(GetRecordError::Timeout { .. }) => {
+                        tracing::warn!(?id, "query address timeout");
+                        None
+                    }
                     _ => unreachable!("either FoundRecord or NotFound should be delivered before"),
                 };
                 ControlFlow::Break(result)
@@ -371,8 +391,12 @@ impl BaseHandle {
                     result: QueryResult::GetClosestPeers(result),
                     ..
                 })) if id == find_id => {
-                    let Ok(result) = result else {
-                        unimplemented!()
+                    let result = match result {
+                        Ok(result) => result,
+                        Err(GetClosestPeersError::Timeout { .. }) => {
+                            tracing::warn!(?id, "query timeout");
+                            return ControlFlow::Break(Default::default());
+                        }
                     };
                     // kad excludes local peer id from `GetClosestPeers` result for unknown reason
                     // so by default, the result from closest peers themselves is different from the others

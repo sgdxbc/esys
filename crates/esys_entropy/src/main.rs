@@ -1,15 +1,16 @@
-use std::{mem::take, net::Ipv4Addr, ops::Range, pin::pin, time::Duration};
+use std::{mem::take, net::Ipv4Addr, ops::Range, pin::pin, sync::Arc, time::Duration};
 
 use clap::Parser;
 use esys_entropy::{App, AppConfig, Base, BaseHandle};
 use libp2p::{
+    bandwidth::BandwidthSinks,
     core::upgrade::Version::V1,
     identity::Keypair,
     multiaddr::{multiaddr, Protocol},
-    tcp, Multiaddr, Swarm, Transport,
+    tcp, Multiaddr, Swarm, Transport, TransportExt,
 };
 use rand::{thread_rng, Rng, RngCore};
-use tokio::{signal::ctrl_c, spawn, task::JoinHandle, time::sleep};
+use tokio::{fs::File, io::AsyncWriteExt, signal::ctrl_c, spawn, task::JoinHandle, time::sleep};
 use tracing::{debug_span, info_span, Instrument};
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
@@ -113,8 +114,10 @@ async fn main() {
             .await;
             control.close();
             let app = app_loop.await.unwrap();
-            app.base.cancel_queries();
-            base.event_loop.await.unwrap();
+            // app.base.cancel_queries().await;
+            // app.base.cancel_observers();
+            drop(app.base);
+            // base.event_loop.await.unwrap();
         } else {
             let mut tasks = Vec::new();
             for i in 0..cli.n {
@@ -138,12 +141,17 @@ async fn main() {
             let mut base_loops = Vec::new();
             let mut app_controls = Vec::new();
             let mut app_loops = Vec::new();
+            let mut bandwidths = Vec::new();
+            let (mut inbound_zero, mut outbound_zero) = (0, 0);
             for base in bases {
                 base_loops.push(base.event_loop);
                 let mut app = App::new(base.handle, base.keypair, base.addr, config.clone());
                 app_controls.push(app.control());
                 let app_loop = spawn(async move { app.serve().await });
                 app_loops.push(app_loop);
+                inbound_zero += base.bandwidth.total_inbound();
+                outbound_zero += base.bandwidth.total_outbound();
+                bandwidths.push(base.bandwidth);
             }
 
             ctrl_c().await.unwrap();
@@ -156,6 +164,18 @@ async fn main() {
             for event_loop in base_loops {
                 event_loop.await.unwrap();
             }
+            let (inbound, outbound) = bandwidths
+                .iter()
+                .map(|bandwidth| (bandwidth.total_inbound(), bandwidth.total_outbound()))
+                .reduce(|(i1, o1), (i2, o2)| (i1 + i2, o1 + o2))
+                .unwrap();
+            let mut bandwidth_out = File::create("bandwidth.txt").await.unwrap();
+            bandwidth_out
+                .write_all(
+                    format!("{},{}\n", inbound - inbound_zero, outbound - outbound_zero).as_bytes(),
+                )
+                .await
+                .unwrap();
         }
     }
 }
@@ -165,6 +185,7 @@ struct StartBase {
     handle: BaseHandle,
     keypair: Keypair,
     addr: Multiaddr,
+    bandwidth: Arc<BandwidthSinks>,
 }
 
 async fn start_base(cli: &Cli, name: impl ToString) -> StartBase {
@@ -174,6 +195,7 @@ async fn start_base(cli: &Cli, name: impl ToString) -> StartBase {
         .authenticate(libp2p::noise::NoiseAuthenticated::xx(&id_keys).unwrap())
         .multiplex(libp2p::yamux::YamuxConfig::default())
         .boxed();
+    let (transport, bandwidth) = transport.with_bandwidth_logging();
     let (event_loop, handle) = Base::run(name, transport, &id_keys);
     let mut first_addr = true;
     let ip = cli.ip;
@@ -201,5 +223,6 @@ async fn start_base(cli: &Cli, name: impl ToString) -> StartBase {
         handle,
         keypair: id_keys,
         addr,
+        bandwidth,
     }
 }
