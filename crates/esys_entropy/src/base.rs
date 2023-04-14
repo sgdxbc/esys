@@ -35,7 +35,7 @@ use tracing::{
 #[derive(NetworkBehavior)]
 pub struct Base {
     identify: Identify,
-    kad: Kademlia<MemoryStore>,
+    pub kad: Kademlia<MemoryStore>,
     pub rpc: crate::rpc::Behavior,
 }
 
@@ -69,13 +69,24 @@ impl Base {
                 "/entropy/0.1.0".into(),
                 keypair.public(),
             )),
-            // kad: Kademlia::with_config(id, MemoryStore::new(id), {
-            //     let mut config = KademliaConfig::default();
-            //     config.set_max_packet_size(1 << 30);
-            //     config.set_query_timeout(Duration::from_secs(8));
-            //     config
-            // }),
-            kad: Kademlia::new(id, MemoryStore::new(id)),
+            kad: Kademlia::with_config(
+                id,
+                MemoryStore::with_config(
+                    id,
+                    libp2p::kad::record::store::MemoryStoreConfig {
+                        max_records: usize::MAX,
+                        max_value_bytes: usize::MAX,
+                        ..Default::default()
+                    },
+                ),
+                {
+                    let mut config = libp2p::kad::KademliaConfig::default();
+                    config.set_max_packet_size(1 << 30);
+                    // config.set_query_timeout(Duration::from_secs(8));
+                    config
+                },
+            ),
+            // kad: Kademlia::new(id, MemoryStore::new(id)),
             rpc: crate::rpc::Behavior::new(
                 Default::default(),
                 [(crate::rpc::Protocol, ProtocolSupport::Full)],
