@@ -11,8 +11,7 @@ On evaluation AWS account, enable evaluated regions and add a key pair called "E
 Prepare control node
 * Run Ubuntu 22.04 (because artifact will be compiled on control node and send to cluster nodes)
     * As user "ubuntu"
-* Install Rust toolchain, C++ toolchain, CMake, Protocol Buffers toolchain, Terraform, Ansible, Jupyter Notebook, 
-  Seaborn
+* Install Rust toolchain, C++ toolchain, CMake, Protocol Buffers toolchain, Terraform, Ansible, Jupyter Notebook, Seaborn
 * Set up AWS credential properly, so it has EC2 and VPC permissions
 * Add this section to SSH config
 ```

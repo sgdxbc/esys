@@ -8,7 +8,7 @@ use std::{
 };
 
 use clap::Parser;
-use esys_entropy::{App, AppConfig, Base, BaseEvent, BaseHandle};
+use esys_entropy::{App, AppConfig, AppControl, Base, BaseEvent, BaseHandle};
 use esys_wirehair::WirehairDecoder;
 use libp2p::{
     bandwidth::BandwidthSinks,
@@ -21,7 +21,7 @@ use libp2p::{
     tcp, Multiaddr, Swarm, Transport, TransportExt,
 };
 use rand::{thread_rng, Rng, RngCore};
-use tokio::{fs::File, io::AsyncWriteExt, signal::ctrl_c, spawn, task::JoinHandle, time::sleep};
+use tokio::{fs, signal::ctrl_c, spawn, task::JoinHandle, time::sleep};
 use tracing::{debug_span, info_span, Instrument};
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
@@ -50,6 +50,9 @@ struct Cli {
     fragment_size: usize,
 
     #[clap(long)]
+    expected_churn_interal: Option<u64>,
+
+    #[clap(long)]
     kademlia: bool,
     #[clap(long, default_value_t = 1)]
     repeat: usize,
@@ -62,6 +65,8 @@ async fn main() {
         .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
         .init();
     let cli = Cli::parse();
+    assert!(cli.fragment_k <= cli.fragment_n);
+    assert!(cli.chunk_k <= cli.chunk_n);
 
     if cli.bootstrap_service {
         let app = start_base(&cli, "service").await;
@@ -326,42 +331,50 @@ async fn main() {
     }
     tracing::info!("READY");
 
-    let mut base_loops = Vec::new();
-    let mut app_controls = Vec::new();
-    let mut app_loops = Vec::new();
-    let mut bandwidths = Vec::new();
+    struct Instance {
+        base_loop: JoinHandle<Swarm<Base>>,
+        base_monitor: JoinHandle<()>,
+        app_control: AppControl,
+        app_loop: JoinHandle<()>,
+        bandwidth: Arc<BandwidthSinks>,
+    }
+    let mut instances = Vec::new();
     let (mut inbound_zero, mut outbound_zero) = (0, 0);
     for base in bases {
-        base_loops.push(base.event_loop);
+        let refresh_interval = if cli.expected_churn_interal.is_some() {
+            Duration::from_secs(30) //
+        } else {
+            Duration::from_secs(86400) // disabled
+        };
+        let base_monitor = base.handle.serve_kad_refresh(refresh_interval);
         let mut app = App::new(base.handle, base.keypair, base.addr, config.clone());
-        app_controls.push(app.control());
+        let app_control = app.control();
         let app_loop = spawn(async move { app.serve().await });
-        app_loops.push(app_loop);
+
         inbound_zero += base.bandwidth.total_inbound();
         outbound_zero += base.bandwidth.total_outbound();
-        bandwidths.push(base.bandwidth);
+
+        instances.push(Instance {
+            base_loop: base.event_loop,
+            base_monitor,
+            app_control,
+            app_loop,
+            bandwidth: base.bandwidth,
+        });
     }
+    let (mut inbound, mut outbound) = (0, 0);
 
     ctrl_c().await.unwrap();
-    for app_control in app_controls {
-        app_control.close();
+    for instance in instances {
+        inbound += instance.bandwidth.total_inbound();
+        outbound += instance.bandwidth.total_outbound();
     }
-    for app_loop in app_loops {
-        app_loop.await.unwrap();
-    }
-    for event_loop in base_loops {
-        event_loop.await.unwrap();
-    }
-    let (inbound, outbound) = bandwidths
-        .iter()
-        .map(|bandwidth| (bandwidth.total_inbound(), bandwidth.total_outbound()))
-        .reduce(|(i1, o1), (i2, o2)| (i1 + i2, o1 + o2))
-        .unwrap();
-    let mut bandwidth_out = File::create("bandwidth.txt").await.unwrap();
-    bandwidth_out
-        .write_all(format!("{},{}\n", inbound - inbound_zero, outbound - outbound_zero).as_bytes())
-        .await
-        .unwrap();
+    fs::write(
+        "bandwidth.txt",
+        format!("{},{}\n", inbound - inbound_zero, outbound - outbound_zero),
+    )
+    .await
+    .unwrap();
 }
 
 struct StartBase {

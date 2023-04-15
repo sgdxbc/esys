@@ -160,7 +160,7 @@ impl App {
             base,
             control: mpsc::unbounded_channel(),
             chunks: Default::default(),
-            invite_resource: Arc::new(Semaphore::new(50)),
+            invite_resource: Arc::new(Semaphore::new(100)),
             client_chunks: Default::default(),
             client_queue: Default::default(),
             put_chunks: None,

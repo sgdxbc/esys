@@ -13,6 +13,7 @@ use libp2p::{
     multihash::Multihash,
     request_response::{ProtocolSupport, ResponseChannel},
     swarm::{
+        dial_opts::DialOpts,
         AddressScore, NetworkBehaviour as NetworkBehavior, SwarmBuilder,
         SwarmEvent::{self, Behaviour as Behavior},
         THandlerErr as HandlerErr,
@@ -20,11 +21,12 @@ use libp2p::{
     Multiaddr, PeerId, Swarm,
 };
 
-use rand::Rng;
+use rand::{thread_rng, Rng};
 use tokio::{
     select, spawn,
     sync::{mpsc, oneshot, Notify},
     task::JoinHandle,
+    time::sleep,
 };
 use tracing::{
     debug_span,
@@ -98,7 +100,9 @@ impl Base {
                 // Default::default(),
             ),
         };
-        let mut swarm = SwarmBuilder::with_tokio_executor(transport, app, id).build();
+        let mut swarm = SwarmBuilder::with_tokio_executor(transport, app, id)
+            .max_negotiating_inbound_streams(65536) // hope this works
+            .build();
         let mut ingress = mpsc::unbounded_channel();
         let handle = BaseHandle { ingress: ingress.0 };
         let name = name.to_string();
@@ -231,6 +235,47 @@ impl BaseHandle {
             ControlFlow::<()>::Continue(())
         });
         drop(s);
+    }
+
+    pub fn serve_kad_refresh(&self, interval: Duration) -> JoinHandle<()> {
+        let s = self.subscribe(move |event, swarm| {
+            if let SwarmEvent::OutgoingConnectionError {
+                peer_id: Some(peer_id),
+                ..
+            } = event.as_ref().unwrap()
+            {
+                swarm.behaviour_mut().kad.remove_peer(peer_id);
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        drop(s);
+        let base = self.clone();
+        spawn(async move {
+            let initial_backoff = thread_rng().gen_range(Duration::ZERO..interval);
+            sleep(initial_backoff).await;
+            loop {
+                sleep(interval).await;
+                base.ingress_wait(|swarm| {
+                    let mut peers = Vec::new();
+                    for kbucket in swarm.behaviour_mut().kad.kbuckets() {
+                        for entry in kbucket.iter() {
+                            peers.push((
+                                entry.node.key.preimage().clone(),
+                                entry.node.value.first().clone(),
+                            ));
+                        }
+                    }
+                    for (peer_id, addr) in peers {
+                        if swarm.is_connected(&peer_id) {
+                            continue;
+                        }
+                        let opts = DialOpts::peer_id(peer_id).addresses(vec![addr]).build();
+                        swarm.dial(opts).unwrap();
+                    }
+                })
+                .await
+            }
+        })
     }
 
     pub async fn cancel_queries(&self) {
