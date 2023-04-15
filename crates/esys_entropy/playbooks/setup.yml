@@ -8,7 +8,7 @@
     run_once: true
   - name: Copy compiled artifact
     ansible.builtin.copy:
-      src: ../../target/release/esys_entropy
+      src: ../../../target/release/esys_entropy
       dest: .
       mode: preserve
   - name: Increase file descriptor limit
@@ -34,7 +34,6 @@
   - ansible.builtin.shell: >
       tmux new-session -d -s esys 
       "./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 400 
-      --chunk-k 10 --chunk-n 10
       --expected-churn-interval 10 || read _"
     environment:
       RUST_LOG: esys_entropy=info

@@ -64,6 +64,7 @@ impl Base {
         name: impl ToString,
         transport: transport::Boxed<(PeerId, StreamMuxerBox)>,
         keypair: &Keypair,
+        more_replication: bool,
     ) -> (JoinHandle<Swarm<Self>>, BaseHandle) {
         let id = PeerId::from_public_key(&keypair.public());
         let app = Self {
@@ -85,7 +86,9 @@ impl Base {
                     let mut config = libp2p::kad::KademliaConfig::default();
                     // config.set_query_timeout(Duration::from_secs(8));
                     config.set_max_packet_size(1 << 30);
-                    config.set_replication_interval(Some(Duration::from_secs(60))); //
+                    if more_replication {
+                        config.set_replication_interval(Some(Duration::from_secs(30)));
+                    }
                     config
                 },
             ),
@@ -102,7 +105,7 @@ impl Base {
             ),
         };
         let mut swarm = SwarmBuilder::with_tokio_executor(transport, app, id)
-            .max_negotiating_inbound_streams(65536) // hope this works
+            // .max_negotiating_inbound_streams(65536) // hope this works
             .build();
         let mut ingress = mpsc::unbounded_channel();
         let handle = BaseHandle { ingress: ingress.0 };

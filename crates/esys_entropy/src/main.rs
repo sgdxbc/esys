@@ -39,13 +39,13 @@ struct Cli {
     #[clap(short, default_value_t = 1)]
     n: usize,
 
-    #[clap(long, default_value_t = 40)]
+    #[clap(long, default_value_t = 8)]
     chunk_k: usize,
-    #[clap(long, default_value_t = 50)]
+    #[clap(long, default_value_t = 10)]
     chunk_n: usize,
-    #[clap(long, default_value_t = 40)]
+    #[clap(long, default_value_t = 32)]
     fragment_k: usize,
-    #[clap(long, default_value_t = 100)]
+    #[clap(long, default_value_t = 80)]
     fragment_n: usize,
     #[clap(long, default_value_t = 0)]
     fragment_size: usize,
@@ -115,7 +115,7 @@ async fn main() {
     };
 
     if cli.put {
-        eprintln!("chunk_k,chunk_n,fragment_k,fragment_n,op,latency");
+        eprintln!("protocol,chunk_k,chunk_n,fragment_k,fragment_n,op,latency");
 
         for _ in 0..cli.repeat {
             let base = init_base(
@@ -132,47 +132,68 @@ async fn main() {
 
             let put_start = Instant::now();
             if cli.kademlia {
-                // let mut put_ids = HashSet::new();
+                let mut put_ids = std::collections::HashSet::new();
                 async {
-                    for fragment in data.chunks_exact(config.fragment_size) {
+                    let mut fragments = Vec::new();
+                    for (i, fragment) in data.chunks_exact(config.fragment_size).enumerate() {
                         let fragment = fragment.to_vec();
                         let key = Code::Sha2_256.digest(&fragment);
                         kademlia_keys.push(key);
+                        if i >= 1 {
+                            fragments.push((key, fragment));
+                            continue;
+                        }
                         let put_id = base
                             .handle
                             .ingress_wait(move |swarm| {
                                 let record = Record::new(key, fragment);
-                                swarm
+                                let put_id = swarm
                                     .behaviour_mut()
                                     .kad
                                     .put_record(
                                         record,
                                         libp2p::kad::Quorum::N(3.try_into().unwrap()),
                                     )
-                                    .unwrap()
+                                    .unwrap();
+                                swarm.behaviour_mut().kad.remove_record(&key.into());
+                                put_id
                             })
                             .await;
-                        // put_ids.insert(put_id);
-                        base.handle
-                            .subscribe(move |event, _| match event.as_ref().unwrap() {
-                                SwarmEvent::Behaviour(BaseEvent::Kad(
-                                    // TODO check result
-                                    KademliaEvent::OutboundQueryProgressed {
-                                        id, result: _, ..
-                                    },
-                                )) => {
-                                    // put_ids.remove(id);
-                                    // if put_ids.is_empty() {
-                                    if *id == put_id {
-                                        ControlFlow::Break(())
-                                    } else {
-                                        ControlFlow::Continue(())
+                        put_ids.insert(put_id);
+                    }
+                    base.handle
+                        .subscribe(move |event, swarm| match event.as_ref().unwrap() {
+                            SwarmEvent::Behaviour(BaseEvent::Kad(
+                                // TODO check result
+                                KademliaEvent::OutboundQueryProgressed { id, result: _, .. },
+                            )) => {
+                                if put_ids.remove(id) {
+                                    tracing::debug!("put fragment {id:?}");
+                                    if let Some((key, fragment)) = fragments.pop() {
+                                        let record = Record::new(key, fragment);
+                                        let put_id = swarm
+                                            .behaviour_mut()
+                                            .kad
+                                            .put_record(
+                                                record,
+                                                libp2p::kad::Quorum::N(3.try_into().unwrap()),
+                                            )
+                                            .unwrap();
+                                        swarm.behaviour_mut().kad.remove_record(&key.into());
+                                        put_ids.insert(put_id);
                                     }
                                 }
-                                _ => ControlFlow::Continue(()),
-                            })
-                            .await;
-                    }
+                                if put_ids.is_empty() {
+                                    // if *id == put_id {
+                                    ControlFlow::Break(())
+                                } else {
+                                    ControlFlow::Continue(())
+                                }
+                            }
+                            _ => ControlFlow::Continue(()),
+                        })
+                        .await;
+                    // }
                 }
                 .instrument(info_span!("put"))
                 .await
@@ -304,7 +325,8 @@ async fn main() {
 
             for (op, latency) in [("put", put_latency), ("get", get_latency)] {
                 eprintln!(
-                    "{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{}",
+                    if cli.kademlia { "kademlia" } else { "entropy" },
                     config.chunk_k,
                     config.chunk_n,
                     config.fragment_k,
@@ -347,12 +369,12 @@ async fn main() {
     let (mut inbound_zero, mut outbound_zero) = (0, 0);
     const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
     for base in bases {
-        let refresh_interval = if cli.expected_churn_interval.is_some() {
-            REFRESH_INTERVAL
+        let base_monitor = if cli.expected_churn_interval.is_some() {
+            base.handle.serve_kad_refresh(REFRESH_INTERVAL)
         } else {
-            Duration::from_secs(86400) // disabled
+            // disabled
+            spawn(async move {})
         };
-        let base_monitor = base.handle.serve_kad_refresh(refresh_interval);
         let mut app = App::new(base.handle, base.keypair, base.addr, config.clone());
         let app_control = app.control();
         let app_loop = spawn(async move { app.serve().await });
@@ -452,7 +474,12 @@ async fn start_base(cli: &Cli, name: impl ToString) -> StartBase {
         .multiplex(libp2p::yamux::YamuxConfig::default())
         .boxed();
     let (transport, bandwidth) = transport.with_bandwidth_logging();
-    let (event_loop, handle) = Base::run(name, transport, &id_keys);
+    let (event_loop, handle) = Base::run(
+        name,
+        transport,
+        &id_keys,
+        cli.expected_churn_interval.is_some(),
+    );
     let mut first_addr = true;
     let ip = cli.ip;
     let notify = handle.serve_add_external_address(move |addr| {

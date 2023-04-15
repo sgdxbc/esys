@@ -30,7 +30,7 @@ async fn main() {
         .authenticate(NoiseAuthenticated::xx(&server_keypair).unwrap())
         .multiplex(YamuxConfig::default())
         .boxed();
-    let (_handle, server_control) = Base::run("bootstrap", transport, &server_keypair);
+    let (_handle, server_control) = Base::run("bootstrap", transport, &server_keypair, false);
     server_control.serve_add_external_address(|addr| Some(addr.clone()));
     server_control.serve_kad_add_address();
     server_control.listen_on("/memory/1".parse().unwrap());
@@ -52,7 +52,7 @@ async fn main() {
                     .authenticate(NoiseAuthenticated::xx(&key_pair).unwrap())
                     .multiplex(YamuxConfig::default())
                     .boxed();
-                let (_handle, control) = Base::run(format!("client-{i}"), transport, &key_pair);
+                let (_handle, control) = Base::run(format!("client-{i}"), transport, &key_pair, false);
                 control.serve_add_external_address(|addr| Some(addr.clone()));
                 control.serve_kad_add_address();
                 control.listen_on("/memory/0".parse().unwrap());
