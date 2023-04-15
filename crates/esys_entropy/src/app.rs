@@ -253,6 +253,8 @@ impl App {
                 }
             }
         }
+
+        tracing::debug!(peer_id = %PeerId::from_public_key(&self.keypair.public()), "close");
     }
 
     fn set_timer(&self, duration: Duration, event: AppEvent) {

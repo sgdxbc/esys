@@ -21,7 +21,8 @@ use libp2p::{
     tcp, Multiaddr, Swarm, Transport, TransportExt,
 };
 use rand::{thread_rng, Rng, RngCore};
-use tokio::{fs, signal::ctrl_c, spawn, task::JoinHandle, time::sleep};
+use rand_distr::{Distribution, Poisson};
+use tokio::{fs, select, signal::ctrl_c, spawn, task::JoinHandle, time::sleep};
 use tracing::{debug_span, info_span, Instrument};
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
@@ -50,7 +51,7 @@ struct Cli {
     fragment_size: usize,
 
     #[clap(long)]
-    expected_churn_interal: Option<u64>,
+    expected_churn_interval: Option<u64>,
 
     #[clap(long)]
     kademlia: bool,
@@ -340,9 +341,10 @@ async fn main() {
     }
     let mut instances = Vec::new();
     let (mut inbound_zero, mut outbound_zero) = (0, 0);
+    const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
     for base in bases {
-        let refresh_interval = if cli.expected_churn_interal.is_some() {
-            Duration::from_secs(30) //
+        let refresh_interval = if cli.expected_churn_interval.is_some() {
+            REFRESH_INTERVAL
         } else {
             Duration::from_secs(86400) // disabled
         };
@@ -363,8 +365,62 @@ async fn main() {
         });
     }
     let (mut inbound, mut outbound) = (0, 0);
+    let mut replace_count = 0;
 
-    ctrl_c().await.unwrap();
+
+    loop {
+        let mut churn_delay =
+            Box::pin(sleep(if let Some(interval) = cli.expected_churn_interval {
+                Duration::from_secs_f64(
+                    Poisson::new(interval as f64)
+                        .unwrap()
+                        .sample(&mut thread_rng()),
+                )
+            } else {
+                Duration::from_secs(86400)
+            }));
+        select! {
+            result = ctrl_c() => {
+                result.unwrap();
+                break;
+            }
+            _ = churn_delay => {
+                async {
+                    let index = thread_rng().gen_range(0..cli.n);
+                    let instance = instances.swap_remove(index);
+                    instance.base_monitor.abort();
+                    instance.app_control.close();
+                    instance.app_loop.await.unwrap();
+                    instance.base_loop.await.unwrap();
+                    inbound += instance.bandwidth.total_inbound();
+                    outbound += instance.bandwidth.total_outbound();
+
+                    let base = start_base(&cli, format!("replace-{replace_count}")).await;
+                    replace_count += 1;
+                    let base_monitor = base.handle.serve_kad_refresh(REFRESH_INTERVAL);
+                    let mut app = App::new(base.handle, base.keypair, base.addr, config.clone());
+                    let app_control = app.control();
+                    let app_loop = spawn(async move { app.serve().await });
+                    instances.push(Instance {
+                        base_loop: base.event_loop,
+                        base_monitor,
+                        app_control,
+                        app_loop,
+                        bandwidth: base.bandwidth,
+                    });
+                }
+                .instrument(info_span!("churn"))
+                .await;
+
+                churn_delay = Box::pin(sleep(Duration::from_secs_f64(
+                    Poisson::new(cli.expected_churn_interval.unwrap() as f64)
+                        .unwrap()
+                        .sample(&mut thread_rng()),
+                )));
+                tracing::trace!(?churn_delay); // to disable false positive unused assignment
+            }
+        }
+    }
     for instance in instances {
         inbound += instance.bandwidth.total_inbound();
         outbound += instance.bandwidth.total_outbound();

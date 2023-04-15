@@ -244,6 +244,7 @@ impl BaseHandle {
                 ..
             } = event.as_ref().unwrap()
             {
+                tracing::debug!(%peer_id, "evict peer");
                 swarm.behaviour_mut().kad.remove_peer(peer_id);
             }
             ControlFlow::<()>::Continue(())
