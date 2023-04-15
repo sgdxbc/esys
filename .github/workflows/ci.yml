@@ -21,7 +21,6 @@ jobs:
           profile: minimal
           toolchain: stable
           override: true
-      - run: rustup component add rustfmt clippy
       - run: sudo snap install --classic protobuf
 
       - uses: actions-rs/cargo@v1
@@ -50,6 +49,7 @@ jobs:
           profile: minimal
           toolchain: beta
           override: true
+      - run: rustup component add rustfmt clippy
       - run: sudo snap install --classic protobuf
 
       - uses: actions-rs/cargo@v1
