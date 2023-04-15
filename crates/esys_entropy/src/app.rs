@@ -322,6 +322,7 @@ impl App {
         let prev_index = chunk.index;
         // add some backup invitations to make sure success in the first try
         chunk.index += (((self.config.fragment_n - chunk.indexes.len()) as f32) * 1.2) as u32;
+        // chunk.index += (self.config.fragment_n - chunk.indexes.len()) as u32;
         // doing eval in a good network so skip retry old indexes
         tracing::debug!(index = ?(prev_index..chunk.index), "invite chunk {chunk_hash:02x?}");
         for index in prev_index..chunk.index {
@@ -534,7 +535,10 @@ impl App {
     }
 
     fn invite(&mut self, chunk_hash: &Multihash) {
-        let chunk = self.chunks.get_mut(chunk_hash).unwrap();
+        let Some(chunk) = self.chunks.get_mut(chunk_hash) else {
+            // 
+            return;
+        };
         // can it get larger then n?
         if chunk.fragment_count() >= self.config.fragment_n {
             tracing::debug!("finish invite for healthy chunk {chunk_hash:02x?}");
@@ -548,6 +552,7 @@ impl App {
             (chunk.low_watermark(&self.config)..=chunk.high_watermark)
                 .filter(|index| !chunk.indexes.contains_key(index)),
         );
+        tracing::info!("invite chunk {chunk_hash:02x?} indexes {invite_indexes:?}");
         for index in invite_indexes {
             self.invite_index(chunk_hash, index);
         }
@@ -630,7 +635,7 @@ impl App {
     }
 
     fn invite_index(&self, chunk_hash: &Multihash, index: u32) {
-        tracing::info!("invite chunk {chunk_hash:02x?} index {index}");
+        // tracing::info!("invite chunk {chunk_hash:02x?} index {index}");
         let chunk = &self.chunks[chunk_hash];
         assert!(!chunk.indexes.contains_key(&index));
         assert!(chunk.watermark(&self.config).contains(&index));
@@ -830,6 +835,7 @@ impl App {
         let public_key = member.public_key().unwrap();
         if !self.verify(&chunk_hash, member.index, &public_key, &member.proof) {
             tracing::warn!("query fragment fail to verify proof");
+            self.base.response_ok(channel);
             return;
         }
 
@@ -1067,12 +1073,14 @@ impl App {
     ) -> bool {
         let mut input = chunk_hash.to_bytes();
         input.extend(&index.to_be_bytes());
+        // we have further watermark check on `insert` so no need to check here
         // hack for client get chunk
-        (if let Some(chunk) = self.chunks.get(chunk_hash) {
-            chunk.watermark(&self.config).contains(&index)
-        } else {
-            true
-        }) && public_key.verify(&input, proof)
+        // (if let Some(chunk) = self.chunks.get(chunk_hash) {
+        //     chunk.watermark(&self.config).contains(&index)
+        // } else {
+        //     true
+        // }) &&
+        public_key.verify(&input, proof)
             && Self::accepted(
                 chunk_hash,
                 index,
@@ -1141,7 +1149,7 @@ impl Chunk {
             };
             if check_alive {
                 if !member.alive {
-                    tracing::warn!("evict not alive member index {}", member.index);
+                    tracing::info!("evict not alive member index {}", member.index);
                     continue;
                 }
                 // skip local member

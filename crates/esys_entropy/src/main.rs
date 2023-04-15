@@ -76,7 +76,7 @@ async fn main() {
         app.event_loop.await.unwrap();
         return;
     }
-    let config = AppConfig {
+    let mut config = AppConfig {
         invite_count: 1,
         chunk_k: cli.chunk_k,
         chunk_n: cli.chunk_n,
@@ -90,8 +90,12 @@ async fn main() {
         watermark_interval: Duration::from_secs(86400),
         membership_interval: Duration::from_secs(30),
         gossip_interval: Duration::from_secs(12),
-        invite_interval: Duration::from_secs(10),
+        invite_interval: Duration::from_secs(30),
     };
+    if cli.expected_churn_interval.is_none() {
+        config.membership_interval = Duration::from_secs(86400);
+        config.gossip_interval = Duration::from_secs(86400);
+    }
 
     let init_base = |base: StartBase, delay_range: Range<Duration>, register_after: Duration| {
         spawn(async move {

@@ -26,14 +26,14 @@ Start evaluation
 $ git submodule init
 $ terraform -chdir=crates/esys_entropy/terraform init
 $ terraform -chdir=crates/esys_entropy/terraform apply
-$ ansible-playbook -i crates/esys_entropy/terraform/inventory.ini crates/esys_entropy/playbook.yml
+$ ansible-playbook -i crates/esys_entropy/terraform/inventory.ini crates/esys_entropy/playbooks/setup.yml
 ```
 
 [Work in progress: pipe output CSV data into plot script]
 
 Clean up
 ```
-$ ansible-playbook -i inventory.ini playbook-shutdown.yml  # optional
+$ ansible-playbook -i crates/esys_entropy/terraform/inventory.ini crates/esys_entropy/playbooks/shutdown.yml  # optional
 $ terraform -chdir=crates/esys_entropy/terraform destroy
 ```
 
