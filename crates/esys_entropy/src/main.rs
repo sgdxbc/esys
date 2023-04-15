@@ -88,9 +88,9 @@ async fn main() {
             cli.fragment_size
         },
         watermark_interval: Duration::from_secs(86400),
-        membership_interval: Duration::from_secs(86400),
-        gossip_interval: Duration::from_secs(86400),
-        invite_interval: Duration::from_secs(600),
+        membership_interval: Duration::from_secs(30),
+        gossip_interval: Duration::from_secs(12),
+        invite_interval: Duration::from_secs(10),
     };
 
     let init_base = |base: StartBase, delay_range: Range<Duration>, register_after: Duration| {
@@ -366,7 +366,6 @@ async fn main() {
     }
     let (mut inbound, mut outbound) = (0, 0);
     let mut replace_count = 0;
-
 
     loop {
         let mut churn_delay =

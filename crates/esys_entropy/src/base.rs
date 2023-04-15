@@ -83,8 +83,9 @@ impl Base {
                 ),
                 {
                     let mut config = libp2p::kad::KademliaConfig::default();
-                    config.set_max_packet_size(1 << 30);
                     // config.set_query_timeout(Duration::from_secs(8));
+                    config.set_max_packet_size(1 << 30);
+                    config.set_replication_interval(Some(Duration::from_secs(60))); //
                     config
                 },
             ),
@@ -244,7 +245,7 @@ impl BaseHandle {
                 ..
             } = event.as_ref().unwrap()
             {
-                tracing::debug!(%peer_id, "evict peer");
+                // tracing::debug!(%peer_id, "evict peer");
                 swarm.behaviour_mut().kad.remove_peer(peer_id);
             }
             ControlFlow::<()>::Continue(())

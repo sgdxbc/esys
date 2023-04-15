@@ -33,6 +33,8 @@
   #     "./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 400 || read _"
   - ansible.builtin.shell: >
       tmux new-session -d -s esys 
-      "./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 400 --expected-churn-interval 20 || read _"
+      "./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 400 
+      --chunk-k 10 --chunk-n 10 --fragment-k 4 --fragment-n 10
+      --expected-churn-interval 10 || read _"
     environment:
-      RUST_LOG: esys_entropy=debug
+      RUST_LOG: esys_entropy=info

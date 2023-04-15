@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     mem::{replace, take},
-    ops::{ControlFlow, RangeInclusive},
+    ops::{ControlFlow, Range},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -12,7 +12,7 @@ use libp2p::{
     identity::{Keypair, PublicKey},
     kad::kbucket,
     multihash::{Code, Hasher, Multihash, MultihashDigest, Sha2_256},
-    request_response::{Message, ResponseChannel},
+    request_response::{Message, OutboundFailure, ResponseChannel},
     swarm::{NetworkBehaviour as NetworkBehavior, SwarmEvent::Behaviour as Behavior},
     Multiaddr, PeerId,
 };
@@ -231,7 +231,7 @@ impl App {
                 },
                 AppEvent::Rpc(libp2p::request_response::Event::OutboundFailure {
                     error, ..
-                }) => {
+                }) if !matches!(error, OutboundFailure::DialFailure) => {
                     tracing::warn!("outbound failure {error:?}")
                 }
                 AppEvent::Rpc(libp2p::request_response::Event::InboundFailure {
@@ -505,17 +505,19 @@ impl App {
 
     fn check_membership(&mut self, chunk_hash: &Multihash) {
         let chunk = self.chunks.get_mut(chunk_hash).unwrap();
-        chunk.retain_alive(&self.config);
-        for member in chunk.members.values_mut() {
-            member.alive = false;
-        }
+        chunk.retain_unique(&self.config, true);
         if !chunk
             .members
             .contains_key(&PeerId::from_public_key(&self.keypair.public()))
         {
+            tracing::debug!("exit chunk {chunk_hash:02x?}");
             self.chunks.remove(chunk_hash);
             return;
         }
+        tracing::debug!(
+            "check membership chunk {chunk_hash:02x?} group size {}",
+            chunk.fragment_count()
+        );
 
         // assert!(chunk.fragment_count() >= self.config.fragment_k);
         if chunk.fragment_count() < self.config.fragment_k {
@@ -535,14 +537,15 @@ impl App {
         let chunk = self.chunks.get_mut(chunk_hash).unwrap();
         // can it get larger then n?
         if chunk.fragment_count() >= self.config.fragment_n {
+            tracing::debug!("finish invite for healthy chunk {chunk_hash:02x?}");
             return;
         }
 
         // assume no more node below high watermark is avaiable i.e. can be successfully invited any more
         chunk.high_watermark += (self.config.fragment_n - chunk.fragment_count()) as u32;
         let invite_indexes = Vec::from_iter(
-            chunk
-                .watermark(&self.config)
+            // not use `chunk.watermark()` to because that is for passively accepting, while this is actively inviting
+            (chunk.low_watermark(&self.config)..=chunk.high_watermark)
                 .filter(|index| !chunk.indexes.contains_key(index)),
         );
         for index in invite_indexes {
@@ -609,7 +612,7 @@ impl App {
                 // later this will cause removing chunk when check membership, so no special treatment here
                 // same for the `insert` in handling QueryProofOk
                 chunk.insert(&chunk_hash, public_key, joining_member, &self.config);
-                chunk.retain_alive(&self.config); // shrink high watermark if possible
+                chunk.retain_unique(&self.config, false); // shrink high watermark if possible
             } else if chunk.will_accept(&chunk_hash, member.index, &member.id(), &self.config) {
                 // this is also the path for receiving gossip from unseen peer
                 // because the gossip always include sender itself in the `members`
@@ -627,6 +630,7 @@ impl App {
     }
 
     fn invite_index(&self, chunk_hash: &Multihash, index: u32) {
+        tracing::info!("invite chunk {chunk_hash:02x?} index {index}");
         let chunk = &self.chunks[chunk_hash];
         assert!(!chunk.indexes.contains_key(&index));
         assert!(chunk.watermark(&self.config).contains(&index));
@@ -822,9 +826,10 @@ impl App {
             });
             return;
         };
+
         let public_key = member.public_key().unwrap();
         if !self.verify(&chunk_hash, member.index, &public_key, &member.proof) {
-            //
+            tracing::warn!("query fragment fail to verify proof");
             return;
         }
 
@@ -837,6 +842,11 @@ impl App {
         let Fragment::Complete(fragment) = &chunk.fragment else {
             panic!("receive query fragment before sending gossip")
         };
+        let Some(local_member) = chunk.members.get(&PeerId::from_public_key(&self.keypair.public())) else {
+            //
+            self.base.response_ok(channel);
+            return;
+        };
         let response = proto::Response::from(proto::QueryFragmentOk {
             chunk_hash: message.chunk_hash.clone(),
             fragment: fragment.clone(),
@@ -844,9 +854,7 @@ impl App {
                 chunk.fragment_index,
                 &self.keypair.public(),
                 &self.addr,
-                chunk.members[&PeerId::from_public_key(&self.keypair.public())]
-                    .proof
-                    .clone(),
+                local_member.proof.clone(),
             )),
             init_members: Default::default(), // not used
         });
@@ -894,7 +902,7 @@ impl App {
 
         let public_key = member.public_key().unwrap();
         if !self.verify(&chunk_hash, member.index, &public_key, &member.proof) {
-            //
+            tracing::warn!("query fragment ok fail to verify proof");
             return;
         }
 
@@ -908,7 +916,7 @@ impl App {
         chunk.indexes.insert(member.index, public_key);
 
         let Fragment::Incomplete(decoder) = &mut chunk.fragment else {
-            //
+            tracing::debug!("get fragment after recovering complete");
             return;
         };
 
@@ -920,6 +928,10 @@ impl App {
         if !recovered {
             return;
         }
+        tracing::info!(
+            "recover complete chunk {chunk_hash:02x?} index {}",
+            chunk.fragment_index
+        );
 
         // replace with a placeholder
         let Fragment::Incomplete(decoder) =
@@ -937,7 +949,6 @@ impl App {
             .unwrap();
         let _ = replace(&mut chunk.fragment, Fragment::Complete(fragment));
 
-        // immediately check membership before sending first gossip?
         self.gossip(&chunk_hash);
         // randomize first membership checking delay to (hopefully) avoid duplicated invitation
         // all members are marked alive on insertion, so no need to add another full membership interval
@@ -953,19 +964,21 @@ impl App {
         channel: ResponseChannel<proto::Response>,
     ) {
         let Some(chunk) = self.chunks.get(&message.chunk_hash()) else {
-            //
+            self.base.response_ok(channel);
             return;
         };
         let local_key = self.keypair.public();
+        let Some(local_member) = chunk.members.get(&PeerId::from_public_key(&local_key)) else {
+            self.base.response_ok(channel);
+            return;
+        };
         let response = proto::Response::from(proto::QueryProofOk {
             chunk_hash: message.chunk_hash.clone(),
             member: Some(proto::Member::new(
                 chunk.fragment_index,
                 &local_key,
                 &self.addr,
-                chunk.members[&PeerId::from_public_key(&local_key)]
-                    .proof
-                    .clone(),
+                local_member.proof.clone(),
             )),
         });
         self.base.ingress(move |swarm| {
@@ -996,7 +1009,7 @@ impl App {
             Member::new(member, true),
             &self.config,
         );
-        chunk.retain_alive(&self.config); // shrink high watermark if possible
+        chunk.retain_unique(&self.config, false); // shrink high watermark if possible
     }
 
     // TODO homomorphic hashing
@@ -1096,15 +1109,22 @@ impl Chunk {
             / config.watermark_interval.as_secs()) as _
     }
 
-    fn watermark(&self, config: &AppConfig) -> RangeInclusive<u32> {
-        self.low_watermark(config)..=self.high_watermark
+    fn watermark(&self, config: &AppConfig) -> Range<u32> {
+        // loosing high watermark a little bit, because some other member may invite the new member earlier
+        // and local member will eventually do so
+        // prevent some unnecessary ignore + query proof
+        self.low_watermark(config)
+            ..u32::max(
+                (self.high_watermark as f32 * 1.2) as _,
+                self.high_watermark + 10,
+            )
     }
 
     fn fragment_count(&self) -> usize {
         self.indexes.len()
     }
 
-    fn retain_alive(&mut self, config: &AppConfig) {
+    fn retain_unique(&mut self, config: &AppConfig, check_alive: bool) {
         let watermark = self.watermark(config);
         let mut members = take(&mut self.members);
         let indexes = take(&mut self.indexes);
@@ -1116,18 +1136,27 @@ impl Chunk {
             };
             // if a member show up for multiple indexes, it should be removed for the lowest index among those, and
             // high indexes will be released here
-            let Some(member) = members.remove(&peer_id) else {
+            let Some(mut member) = members.remove(&peer_id) else {
                 continue;
             };
-            if !member.alive {
-                continue;
+            if check_alive {
+                if !member.alive {
+                    tracing::warn!("evict not alive member index {}", member.index);
+                    continue;
+                }
+                // skip local member
+                if member.index != self.fragment_index {
+                    member.alive = false;
+                }
             }
             self.indexes.insert(index, public_key.clone());
             self.members.insert(peer_id, member);
             alive_count += 1;
 
             // all higher indexes are released, shrinking the high watermark
-            if alive_count == config.fragment_n {
+            // loose the guard a little bit because some members may die soon
+            if alive_count == config.fragment_n + 10 {
+                tracing::debug!("shrink high watermark to {index}");
                 self.high_watermark = index;
                 break;
             }
@@ -1169,9 +1198,14 @@ impl Chunk {
             &PeerId::from_public_key(&public_key),
             config,
         ) {
+            tracing::debug!(
+                "reject inserting chunk {chunk_hash:02x?} index {}",
+                member.index
+            );
             return false;
         }
         let index = member.index;
+        tracing::debug!("insert chunk {chunk_hash:02x?} index {index}");
         self.members
             .insert(PeerId::from_public_key(&public_key), member);
         self.indexes.insert(index, public_key);
