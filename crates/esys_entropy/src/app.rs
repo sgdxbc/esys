@@ -121,6 +121,7 @@ enum AppEvent {
         HashMap<PeerId, Member>,
         mpsc::UnboundedSender<(u32, Vec<u8>)>,
     ),
+    ClientGet(Multihash, mpsc::UnboundedSender<(u32, Vec<u8>)>),
 }
 
 impl AppControl {
@@ -149,6 +150,14 @@ impl AppControl {
                 members,
                 channel.0,
             ))
+            .unwrap();
+        channel.1
+    }
+
+    pub fn get(&self, chunk_hash: &Multihash) -> mpsc::UnboundedReceiver<(u32, Vec<u8>)> {
+        let channel = mpsc::unbounded_channel();
+        self.0
+            .send(AppEvent::ClientGet(*chunk_hash, channel.0))
             .unwrap();
         channel.1
     }
@@ -250,6 +259,10 @@ impl App {
                 AppEvent::ClientGetWithMembers(chunk_hash, members, channel) => {
                     self.get_chunks.insert(chunk_hash, channel);
                     self.get_with_members(&chunk_hash, members)
+                }
+                AppEvent::ClientGet(chunk_hash, channel) => {
+                    self.get_chunks.insert(chunk_hash, channel);
+                    self.get(&chunk_hash)
                 }
             }
         }
@@ -480,6 +493,34 @@ impl App {
             self.base.ingress(move |swarm| {
                 swarm.behaviour_mut().rpc_ensure_address(&id, addr);
                 swarm.behaviour_mut().rpc.send_request(&id, request);
+            });
+        }
+    }
+
+    fn get(&mut self, chunk_hash: &Multihash) {
+        let chunk_hash = *chunk_hash;
+        let request = proto::Request::from(proto::QueryFragment {
+            chunk_hash: chunk_hash.to_bytes(),
+            member: None,
+        });
+        for index in 0..(self.config.fragment_n as f32 * 1.2) as u32 {
+            let base = self.base.clone();
+            let invite_resource = self.invite_resource.clone();
+            let request = request.clone();
+            spawn(async move {
+                for (peer_id, addr) in {
+                    let _guard = invite_resource.acquire().await;
+                    base.query(Self::fragment_hash(&chunk_hash, index), 1).await
+                } {
+                    let Some(addr) = addr else {
+                        continue;
+                    };
+                    let request = request.clone();
+                    base.ingress(move |swarm| {
+                        swarm.behaviour_mut().rpc_ensure_address(&peer_id, addr);
+                        swarm.behaviour_mut().rpc.send_request(&peer_id, request);
+                    });
+                }
             });
         }
     }

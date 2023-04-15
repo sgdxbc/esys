@@ -55,6 +55,8 @@ struct Cli {
 
     #[clap(long)]
     kademlia: bool,
+    #[clap(long)]
+    slow: bool,
     #[clap(long, default_value_t = 1)]
     repeat: usize,
 }
@@ -285,7 +287,11 @@ async fn main() {
                     for (chunk_index, chunk_hash, members) in
                         chunks.into_iter().take(config.chunk_k + 1)
                     {
-                        let mut get_fragments = control.get_with_members(&chunk_hash, members);
+                        let mut get_fragments = if cli.slow {
+                            control.get(&chunk_hash)
+                        } else {
+                            control.get_with_members(&chunk_hash, members)
+                        };
                         let mut decoder = WirehairDecoder::new(
                             (config.fragment_size * config.fragment_k) as _,
                             config.fragment_size as _,
