@@ -64,6 +64,7 @@ struct Config {
 enum Event {
     Churn,
     IncreaseWatermark(FragmentId), // add (object, chunk) if not all chunk spawn at/close to time zero
+    Report,
     End,
 }
 
@@ -166,10 +167,7 @@ impl System {
         }
 
         system.add_churn_event(&mut rng);
-        system.insert_event(
-            system.config.increase_watermark_interval_sec(),
-            Event::IncreaseWatermark(0),
-        );
+        system.insert_event(system.config.watermark_sec, Event::IncreaseWatermark(0));
         system
     }
 
@@ -385,12 +383,40 @@ impl System {
             }
         }
         self.insert_event(
-            self.config.increase_watermark_interval_sec(),
+            self.config.watermark_sec,
             Event::IncreaseWatermark(fragment_id + 1),
         );
     }
 
-    fn on_end(&mut self) {}
+    fn on_report(&mut self) {
+        self.report();
+        self.insert_event(86400, Event::Report);
+    }
+
+    fn on_end(&mut self) {
+        self.report()
+    }
+
+    fn report(&self) {
+        println!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            self.config.churn_rate,
+            self.config.node_count,
+            self.now,
+            self.config.faulty_rate,
+            self.config.object_count,
+            self.config.chunk_n,
+            self.config.chunk_k,
+            self.config.fragment_n,
+            self.config.fragment_k,
+            self.config.cache_sec,
+            self.config.targeted_count,
+            self.stats.data_lost,
+            self.stats.targeted,
+            self.stats.repair,
+            self.objects[0].chunks[0].alive_count,
+        );
+    }
 
     fn run(&mut self, mut rng: impl Rng) {
         self.insert_event(self.config.duration * 86400 * 365, Event::End);
@@ -402,19 +428,13 @@ impl System {
             match event {
                 Churn => self.on_churn(&mut rng),
                 IncreaseWatermark(fragment_id) => self.on_increase_watermark(fragment_id, &mut rng),
+                Report => self.on_report(),
                 End => {
                     self.on_end();
                     break;
                 }
             }
         }
-    }
-}
-
-impl Config {
-    fn increase_watermark_interval_sec(&self) -> u32 {
-        // (365. * 86400. / self.churn_rate / self.fragment_n as f32) as _
-        365 * 86400 * 100 // disable
     }
 }
 
@@ -473,62 +493,62 @@ fn main() {
     // }
 
     // object count vs. repair traffic
-    config.churn_rate = 4.;
-    config.duration = 1;
-    let object_counts = [1, 10, 100, 1000];
-    // kademlia
-    for object_count in object_counts {
-        config.object_count = object_count;
-        systems.extend(
-            repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
-        );
-    }
-    // entropy
+    // config.churn_rate = 4.;
+    // config.duration = 1;
+    // let object_counts = [1, 10, 100, 1000];
+    // // kademlia
+    // for object_count in object_counts {
+    //     config.object_count = object_count;
+    //     systems.extend(
+    //         repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
+    //     );
+    // }
+    // // entropy
+    // config = Config {
+    //     chunk_n: 100,
+    //     chunk_k: 80,
+    //     fragment_n: 500,
+    //     fragment_k: 200,
+    //     cache_sec: 0,
+    //     ..config
+    // };
+    // config.watermark_sec = (365. * 86400. / config.churn_rate / config.fragment_n as f32) as _;
+    // for cache_sec in [0, 6 * 3600, 12 * 3600, 24 * 3600, 48 * 3600] {
+    //     config.cache_sec = cache_sec;
+    //     for object_count in object_counts {
+    //         config.object_count = object_count;
+    //         systems.extend(
+    //             repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
+    //         );
+    //     }
+    // }
+
+    // time vs. faulty portion
     config = Config {
-        chunk_n: 100,
-        chunk_k: 80,
-        fragment_n: 500,
-        fragment_k: 200,
+        churn_rate: 4.,
+        faulty_rate: 0.33,
         cache_sec: 0,
+        chunk_k: 1,
+        chunk_n: 1,
+        fragment_k: 32,
+        fragment_n: 80,
+        allow_data_lost: false,
         ..config
     };
-    config.watermark_sec = (365. * 86400. / config.churn_rate / config.fragment_n as f32) as _;
-    for cache_sec in [0, 6 * 3600, 12 * 3600, 24 * 3600, 48 * 3600] {
-        config.cache_sec = cache_sec;
-        for object_count in object_counts {
-            config.object_count = object_count;
-            systems.extend(
-                repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
-            );
-        }
-    }
+    config.watermark_sec = (365. * 86400. / config.churn_rate / config.fragment_n as f32 * config.faulty_rate) as _;
+    systems.push((config.clone(), StdRng::from_rng(&mut seeder).unwrap()));
 
     println!(
         "churn_rate,node_count,duration,faulty_rate,object_count,chunk_n,chunk_k,\
-        fragment_n,fragment_k,cache_sec,targeted_count,data_lost,targeted,repair"
+        fragment_n,fragment_k,cache_sec,targeted_count,data_lost,targeted,repair,alive_count"
     );
 
     systems.into_par_iter().for_each(|(config, mut rng)| {
         eprintln!("{config:?}");
         let mut system = System::new(config, &mut rng);
+        // time vs. faulty portion
+        system.insert_event(12 * 3600, Event::Report);
         system.run(rng);
         eprintln!("{:?}", system.stats);
-        println!(
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-            system.config.churn_rate,
-            system.config.node_count,
-            system.config.duration,
-            system.config.faulty_rate,
-            system.config.object_count,
-            system.config.chunk_n,
-            system.config.chunk_k,
-            system.config.fragment_n,
-            system.config.fragment_k,
-            system.config.cache_sec,
-            system.config.targeted_count,
-            system.stats.data_lost,
-            system.stats.targeted,
-            system.stats.repair
-        );
     })
 }
