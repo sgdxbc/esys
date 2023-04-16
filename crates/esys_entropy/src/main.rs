@@ -14,7 +14,7 @@ use libp2p::{
     bandwidth::BandwidthSinks,
     core::upgrade::Version::V1,
     identity::Keypair,
-    kad::{GetRecordOk, KademliaEvent, QueryResult, Record},
+    kad::{KademliaEvent, QueryResult, Record},
     multiaddr::{multiaddr, Protocol},
     multihash::{Code, MultihashDigest},
     swarm::SwarmEvent,
@@ -22,7 +22,7 @@ use libp2p::{
 };
 use rand::{thread_rng, Rng, RngCore};
 use rand_distr::{Distribution, Poisson};
-use tokio::{fs, select, signal::ctrl_c, spawn, task::JoinHandle, time::sleep};
+use tokio::{fs, select, signal::ctrl_c, spawn, sync::mpsc, task::JoinHandle, time::sleep};
 use tracing::{debug_span, info_span, Instrument};
 use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
 
@@ -134,21 +134,38 @@ async fn main() {
 
             let put_start = Instant::now();
             if cli.kademlia {
-                let mut put_ids = std::collections::HashSet::new();
                 async {
-                    let mut fragments = Vec::new();
+                    let mut finished = mpsc::unbounded_channel();
+                    let _s = base.handle.subscribe(move |event, _| {
+                        if let SwarmEvent::Behaviour(BaseEvent::Kad(
+                            // TODO check result
+                            KademliaEvent::OutboundQueryProgressed {
+                                id,
+                                result: QueryResult::PutRecord(Ok(_)),
+                                ..
+                            },
+                        )) = event.as_ref().unwrap()
+                        {
+                            tracing::debug!("put fragment {id:?}");
+                            finished.0.send(*id).unwrap();
+                        }
+                        ControlFlow::<()>::Continue(())
+                    });
+
+                    let mut put_ids = std::collections::HashSet::new();
+                    let mut records = Vec::new();
                     for (i, fragment) in data.chunks_exact(config.fragment_size).enumerate() {
                         let fragment = fragment.to_vec();
                         let key = Code::Sha2_256.digest(&fragment);
+                        let record = Record::new(key, fragment);
                         kademlia_keys.push(key);
-                        if i >= 1 {
-                            fragments.push((key, fragment));
+                        if i >= 50 {
+                            records.push(record);
                             continue;
                         }
                         let put_id = base
                             .handle
                             .ingress_wait(move |swarm| {
-                                let record = Record::new(key, fragment);
                                 let put_id = swarm
                                     .behaviour_mut()
                                     .kad
@@ -163,39 +180,33 @@ async fn main() {
                             .await;
                         put_ids.insert(put_id);
                     }
-                    base.handle
-                        .subscribe(move |event, swarm| match event.as_ref().unwrap() {
-                            SwarmEvent::Behaviour(BaseEvent::Kad(
-                                // TODO check result
-                                KademliaEvent::OutboundQueryProgressed { id, result: _, .. },
-                            )) => {
-                                if put_ids.remove(id) {
-                                    tracing::debug!("put fragment {id:?}");
-                                    if let Some((key, fragment)) = fragments.pop() {
-                                        let record = Record::new(key, fragment);
-                                        let put_id = swarm
-                                            .behaviour_mut()
-                                            .kad
-                                            .put_record(
-                                                record,
-                                                libp2p::kad::Quorum::N(3.try_into().unwrap()),
-                                            )
-                                            .unwrap();
-                                        swarm.behaviour_mut().kad.remove_record(&key.into());
-                                        put_ids.insert(put_id);
-                                    }
-                                }
+                    while let Some(finished_id) = finished.1.recv().await {
+                        if put_ids.remove(&finished_id) {
+                            let Some(record) = records.pop() else {
                                 if put_ids.is_empty() {
-                                    // if *id == put_id {
-                                    ControlFlow::Break(())
-                                } else {
-                                    ControlFlow::Continue(())
+                                    break;
                                 }
-                            }
-                            _ => ControlFlow::Continue(()),
-                        })
-                        .await;
-                    // }
+                                continue;
+                            };
+                            let key = record.key.clone();
+                            let put_id = base
+                                .handle
+                                .ingress_wait(move |swarm| {
+                                    let put_id = swarm
+                                        .behaviour_mut()
+                                        .kad
+                                        .put_record(
+                                            record,
+                                            libp2p::kad::Quorum::N(3.try_into().unwrap()),
+                                        )
+                                        .unwrap();
+                                    swarm.behaviour_mut().kad.remove_record(&key.into());
+                                    put_id
+                                })
+                                .await;
+                            put_ids.insert(put_id);
+                        }
+                    }
                 }
                 .instrument(info_span!("put"))
                 .await
@@ -235,42 +246,57 @@ async fn main() {
             let get_start = Instant::now();
             if cli.kademlia {
                 async {
-                    for key in kademlia_keys {
+                    let mut finished = mpsc::unbounded_channel();
+                    let _s = base.handle.subscribe(move |event, swarm| {
+                        if let SwarmEvent::Behaviour(BaseEvent::Kad(
+                            // TODO check result
+                            KademliaEvent::OutboundQueryProgressed {
+                                id,
+                                result: QueryResult::GetRecord(Ok(_)),
+                                ..
+                            },
+                        )) = event.as_ref().unwrap()
+                        {
+                            if let Some(mut query) = swarm.behaviour_mut().kad.query_mut(id) {
+                                query.finish();
+                            }
+                            tracing::debug!("get fragment {id:?}");
+                            let _ = finished.0.send(*id); // possibly sending duplicated id
+                        }
+                        ControlFlow::<()>::Continue(())
+                    });
+
+                    let mut get_ids = std::collections::HashSet::new();
+                    let mut i = 0;
+                    while let Some(key) = kademlia_keys.pop() {
                         let get_id = base
                             .handle
                             .ingress_wait(move |swarm| {
                                 swarm.behaviour_mut().kad.get_record(key.into())
                             })
                             .await;
-                        let _fragment =
-                            base.handle
-                                .subscribe(move |event, swarm| match event.as_ref().unwrap() {
-                                    SwarmEvent::Behaviour(BaseEvent::Kad(
-                                        KademliaEvent::OutboundQueryProgressed {
-                                            id,
-                                            result:
-                                                QueryResult::GetRecord(Ok(GetRecordOk::FoundRecord(
-                                                    result,
-                                                ))),
-                                            ..
-                                        },
-                                    )) => {
-                                        // put_ids.remove(id);
-                                        // if put_ids.is_empty() {
-                                        if *id == get_id {
-                                            if let Some(mut query) =
-                                                swarm.behaviour_mut().kad.query_mut(id)
-                                            {
-                                                query.finish()
-                                            }
-                                            ControlFlow::Break(result.record.value.clone())
-                                        } else {
-                                            ControlFlow::Continue(())
-                                        }
-                                    }
-                                    _ => ControlFlow::Continue(()),
+                        get_ids.insert(get_id);
+                        i += 1;
+                        if i == 100 {
+                            break;
+                        }
+                    }
+                    while let Some(finished_id) = finished.1.recv().await {
+                        if get_ids.remove(&finished_id) {
+                            let Some(key) = kademlia_keys.pop() else {
+                                if get_ids.is_empty() {
+                                    break;
+                                }
+                                continue;
+                            };
+                            let get_id = base
+                                .handle
+                                .ingress_wait(move |swarm| {
+                                    swarm.behaviour_mut().kad.get_record(key.into())
                                 })
                                 .await;
+                            get_ids.insert(get_id);
+                        }
                     }
                 }
                 .instrument(info_span!("get"))
@@ -354,7 +380,7 @@ async fn main() {
             Duration::from_millis(2 * 1000)..Duration::from_millis(10 * 1000),
             // up to 20s random delay diff + up to 40s bootstrap latency
             // Duration::from_millis(80 * 1000),
-            Duration::from_millis(25 * 1000),
+            Duration::from_millis(30 * 1000),
         ));
     }
 
@@ -474,11 +500,19 @@ struct StartBase {
 
 async fn start_base(cli: &Cli, name: impl ToString) -> StartBase {
     let id_keys = Keypair::generate_ed25519();
-    let transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true))
-        .upgrade(V1)
-        .authenticate(libp2p::noise::NoiseAuthenticated::xx(&id_keys).unwrap())
-        .multiplex(libp2p::yamux::YamuxConfig::default())
-        .boxed();
+    let transport = tcp::tokio::Transport::new(
+        tcp::Config::default(), // .nodelay(true)
+    )
+    .upgrade(V1)
+    .authenticate(libp2p::noise::NoiseAuthenticated::xx(&id_keys).unwrap())
+    // .multiplex(libp2p::yamux::YamuxConfig::default())
+    .multiplex({
+        let mut config = libp2p::mplex::MplexConfig::default();
+        config.set_max_num_streams(usize::MAX);
+        config.set_max_buffer_size(usize::MAX);
+        config
+    })
+    .boxed();
     let (transport, bandwidth) = transport.with_bandwidth_logging();
     let (event_loop, handle) = Base::run(
         name,

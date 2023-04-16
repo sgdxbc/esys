@@ -88,6 +88,7 @@ module "region-1" {
   providers = {
     aws = aws.ap-east-1
   }
+  instance_count = 1
 }
 
 module "region-2" {
@@ -95,6 +96,7 @@ module "region-2" {
   providers = {
     aws = aws.ap-east-1
   }
+  instance_count = 1
 }
 
 module "region-3" {
@@ -102,6 +104,7 @@ module "region-3" {
   providers = {
     aws = aws.ap-east-1
   }
+  instance_count = 1
 }
 
 module "region-4" {
@@ -109,6 +112,7 @@ module "region-4" {
   providers = {
     aws = aws.ap-east-1
   }
+  instance_count = 1
 }
 
 module "region-5" {
@@ -116,6 +120,7 @@ module "region-5" {
   providers = {
     aws = aws.ap-east-1
   }
+  instance_count = 1
 }
 
 

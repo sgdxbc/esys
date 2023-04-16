@@ -68,10 +68,11 @@ impl Base {
     ) -> (JoinHandle<Swarm<Self>>, BaseHandle) {
         let id = PeerId::from_public_key(&keypair.public());
         let app = Self {
-            identify: Identify::new(identify::Config::new(
-                "/entropy/0.1.0".into(),
-                keypair.public(),
-            )),
+            identify: Identify::new(
+                identify::Config::new("/entropy/0.1.0".into(), keypair.public())
+                    // in our setup the info never change
+                    .with_interval(Duration::from_secs(86400)),
+            ),
             kad: Kademlia::with_config(
                 id,
                 MemoryStore::with_config(
@@ -105,7 +106,7 @@ impl Base {
             ),
         };
         let mut swarm = SwarmBuilder::with_tokio_executor(transport, app, id)
-            // .max_negotiating_inbound_streams(65536) // hope this works
+            .max_negotiating_inbound_streams(65536) // hope this works
             .build();
         let mut ingress = mpsc::unbounded_channel();
         let handle = BaseHandle { ingress: ingress.0 };
@@ -423,12 +424,16 @@ impl BaseHandle {
                         }
                         Some(Multiaddr::try_from(result.record.value).unwrap())
                     }
-                    Err(GetRecordError::NotFound { .. }) => None,
+                    // is this expected?
+                    Ok(GetRecordOk::FinishedWithNoAdditionalRecord { .. })
+                    | Err(GetRecordError::NotFound { .. }) => None,
                     Err(GetRecordError::Timeout { .. }) => {
                         tracing::warn!(?id, "query address timeout");
                         None
                     }
-                    _ => unreachable!("either FoundRecord or NotFound should be delivered before"),
+                    result => unreachable!(
+                        "either FoundRecord or NotFound should be delivered before {result:?}"
+                    ),
                 };
                 ControlFlow::Break(result)
             }

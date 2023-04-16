@@ -28,12 +28,12 @@
 - name: Start Normal Peers
   hosts: normal
   tasks:
-  # - ansible.builtin.shell: >
-  #     tmux new-session -d -s esys 
-  #     "./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 400 || read _"
   - ansible.builtin.shell: >
       tmux new-session -d -s esys 
-      "./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 400 
-      --expected-churn-interval 10 || read _"
+      "./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 400 || read _"
+  # - ansible.builtin.shell: >
+  #     tmux new-session -d -s esys 
+  #     "./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 400 
+  #     --expected-churn-interval 10 || read _"
     environment:
       RUST_LOG: esys_entropy=info

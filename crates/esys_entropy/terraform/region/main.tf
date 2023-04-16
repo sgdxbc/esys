@@ -79,7 +79,7 @@ variable "instance_type" {
 
 variable "instance_count" {
   type    = number
-  default = 1
+  default = 5
 }
 
 resource "aws_instance" "esys-entropy" {
