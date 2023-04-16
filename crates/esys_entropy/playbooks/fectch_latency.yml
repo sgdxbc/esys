@@ -1,0 +1,7 @@
+---
+- hosts: service
+  tasks:
+  - ansible.posix.synchronize:
+      mode: pull
+      src: put-get_*.csv
+      dest: "{{ playbook_dir }}/../../../"

@@ -169,7 +169,7 @@ impl App {
             base,
             control: mpsc::unbounded_channel(),
             chunks: Default::default(),
-            invite_resource: Arc::new(Semaphore::new(100)),
+            invite_resource: Arc::new(Semaphore::new(50)),
             client_chunks: Default::default(),
             client_queue: Default::default(),
             put_chunks: None,
@@ -334,7 +334,7 @@ impl App {
 
         let prev_index = chunk.index;
         // add some backup invitations to make sure success in the first try
-        chunk.index += (((self.config.fragment_n - chunk.indexes.len()) as f32) * 1.2) as u32;
+        chunk.index += (((self.config.fragment_n - chunk.indexes.len()) as f32) * 2.) as u32;
         // chunk.index += (self.config.fragment_n - chunk.indexes.len()) as u32;
         // doing eval in a good network so skip retry old indexes
         tracing::debug!(index = ?(prev_index..chunk.index), "invite chunk {chunk_hash:02x?}");
@@ -503,7 +503,7 @@ impl App {
             chunk_hash: chunk_hash.to_bytes(),
             member: None,
         });
-        for index in 0..(self.config.fragment_n as f32 * 1.2) as u32 {
+        for index in 0..(self.config.fragment_n as f32 * 2.) as u32 {
             let base = self.base.clone();
             let invite_resource = self.invite_resource.clone();
             let request = request.clone();

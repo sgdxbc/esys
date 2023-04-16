@@ -43,7 +43,7 @@ module "service" {
     aws = aws.ap-east-1
   }
 
-  instance_type  = "c5.2xlarge"
+  instance_type  = "m5.2xlarge"
   instance_count = 1
 }
 
@@ -88,7 +88,6 @@ module "region-1" {
   providers = {
     aws = aws.ap-east-1
   }
-  instance_count = 1
 }
 
 module "region-2" {
@@ -96,7 +95,6 @@ module "region-2" {
   providers = {
     aws = aws.ap-east-1
   }
-  instance_count = 1
 }
 
 module "region-3" {
@@ -104,7 +102,6 @@ module "region-3" {
   providers = {
     aws = aws.ap-east-1
   }
-  instance_count = 1
 }
 
 module "region-4" {
@@ -112,7 +109,6 @@ module "region-4" {
   providers = {
     aws = aws.ap-east-1
   }
-  instance_count = 1
 }
 
 module "region-5" {
@@ -120,7 +116,6 @@ module "region-5" {
   providers = {
     aws = aws.ap-east-1
   }
-  instance_count = 1
 }
 
 

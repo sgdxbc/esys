@@ -4,7 +4,7 @@ use std::{
     ops::{ControlFlow, Range},
     pin::pin,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant}, io::stderr,
 };
 
 use clap::Parser;
@@ -66,6 +66,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
+        .with_writer(stderr)
         .init();
     let cli = Cli::parse();
     assert!(cli.fragment_k <= cli.fragment_n);
@@ -117,7 +118,7 @@ async fn main() {
     };
 
     if cli.put {
-        eprintln!("protocol,chunk_k,chunk_n,fragment_k,fragment_n,op,latency");
+        println!("protocol,chunk_k,chunk_n,fragment_k,fragment_n,op,latency");
 
         for _ in 0..cli.repeat {
             let base = init_base(
@@ -355,8 +356,18 @@ async fn main() {
             }
             let get_latency = Instant::now() - get_start;
 
-            for (op, latency) in [("put", put_latency), ("get", get_latency)] {
-                eprintln!(
+            for (op, latency) in [
+                ("put", put_latency),
+                (
+                    if !cli.kademlia && cli.slow {
+                        "slow_get"
+                    } else {
+                        "get"
+                    },
+                    get_latency,
+                ),
+            ] {
+                println!(
                     "{},{},{},{},{},{},{}",
                     if cli.kademlia { "kademlia" } else { "entropy" },
                     config.chunk_k,
@@ -377,10 +388,10 @@ async fn main() {
             start_base(&cli, format!("normal-{i}")).await,
             // wait for the farest peers
             // Duration::ZERO..Duration::from_millis(20 * 1000),
-            Duration::from_millis(2 * 1000)..Duration::from_millis(10 * 1000),
+            Duration::from_millis(2 * 1000)..Duration::from_millis(20 * 1000),
             // up to 20s random delay diff + up to 40s bootstrap latency
             // Duration::from_millis(80 * 1000),
-            Duration::from_millis(30 * 1000),
+            Duration::from_millis(60 * 1000),
         ));
     }
 
