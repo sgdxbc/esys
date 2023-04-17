@@ -38,4 +38,4 @@ terraform.rc
 
 inventory.ini
 *.csv
-*.svg
+*.pdf
