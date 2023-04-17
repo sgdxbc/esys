@@ -387,7 +387,7 @@ async fn main() {
         tasks.push(init_base(
             start_base(&cli, format!("normal-{i}")).await,
             // wait for the farest peers
-            Duration::ZERO..Duration::from_millis(20 * 1000),
+            Duration::from_millis(2 * 1000)..Duration::from_millis(20 * 1000),
             // Duration::from_millis(2 * 1000)..Duration::from_millis(20 * 1000),
             // up to 20s random delay diff + up to 40s bootstrap latency
             Duration::from_millis(300 * 1000),
