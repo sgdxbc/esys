@@ -40,49 +40,13 @@ provider "aws" {
 module "service" {
   source = "./region"
   providers = {
-    aws = aws.ap-east-1
+    aws = aws.ap-southeast-1
   }
 
   instance_type  = "m5.2xlarge"
   instance_count = 1
 }
 
-# module "region-1" {
-#   source = "./region"
-#   providers = {
-#     aws = aws.ap-southeast-1
-#   }
-# }
-
-# module "region-2" {
-#   source = "./region"
-#   providers = {
-#     aws = aws.us-west-1
-#   }
-# }
-
-# module "region-3" {
-#   source = "./region"
-#   providers = {
-#     aws = aws.eu-central-1
-#   }
-# }
-
-# module "region-4" {
-#   source = "./region"
-#   providers = {
-#     aws = aws.sa-east-1
-#   }
-# }
-
-# module "region-5" {
-#   source = "./region"
-#   providers = {
-#     aws = aws.af-south-1
-#   }
-# }
-
-# ultra low latency setup for dev
 module "region-1" {
   source = "./region"
   providers = {
@@ -93,30 +57,66 @@ module "region-1" {
 module "region-2" {
   source = "./region"
   providers = {
-    aws = aws.ap-east-1
+    aws = aws.us-west-1
   }
 }
 
 module "region-3" {
   source = "./region"
   providers = {
-    aws = aws.ap-east-1
+    aws = aws.eu-central-1
   }
 }
 
 module "region-4" {
   source = "./region"
   providers = {
-    aws = aws.ap-east-1
+    aws = aws.sa-east-1
   }
 }
 
 module "region-5" {
   source = "./region"
   providers = {
-    aws = aws.ap-east-1
+    aws = aws.af-south-1
   }
 }
+
+# ultra low latency setup for dev
+# module "region-1" {
+#   source = "./region"
+#   providers = {
+#     aws = aws.ap-east-1
+#   }
+# }
+
+# module "region-2" {
+#   source = "./region"
+#   providers = {
+#     aws = aws.ap-east-1
+#   }
+# }
+
+# module "region-3" {
+#   source = "./region"
+#   providers = {
+#     aws = aws.ap-east-1
+#   }
+# }
+
+# module "region-4" {
+#   source = "./region"
+#   providers = {
+#     aws = aws.ap-east-1
+#   }
+# }
+
+# module "region-5" {
+#   source = "./region"
+#   providers = {
+#     aws = aws.ap-east-1
+#   }
+# }
 
 
 resource "local_file" "inventory" {

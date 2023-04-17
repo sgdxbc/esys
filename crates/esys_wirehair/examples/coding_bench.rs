@@ -5,13 +5,13 @@ use rand::{random, thread_rng, RngCore};
 
 const OBJECT_SIZE: usize = 1 << 30;
 fn main() {
-    let outer_codings = [(10, 10)];
-    let inner_codings = [(64, 100)];
+    let outer_codings = [(4, 5), (8, 10), (12, 15)];
+    let inner_codings = [(32, 80)];
 
     println!("chunk_k,chunk_n,fragment_k,fragment_n,encode,decode");
     for (chunk_k, chunk_n) in outer_codings {
         for (fragment_k, fragment_n) in inner_codings {
-            for _ in 0..10 {
+            for _ in 0..3 {
                 run(chunk_k, chunk_n, fragment_k, fragment_n);
             }
         }

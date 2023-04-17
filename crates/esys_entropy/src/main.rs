@@ -160,7 +160,7 @@ async fn main() {
                         let key = Code::Sha2_256.digest(&fragment);
                         let record = Record::new(key, fragment);
                         kademlia_keys.push(key);
-                        if i >= 50 {
+                        if i >= 200 {
                             records.push(record);
                             continue;
                         }
@@ -278,7 +278,7 @@ async fn main() {
                             .await;
                         get_ids.insert(get_id);
                         i += 1;
-                        if i == 100 {
+                        if i == 200 {
                             break;
                         }
                     }
@@ -387,11 +387,11 @@ async fn main() {
         tasks.push(init_base(
             start_base(&cli, format!("normal-{i}")).await,
             // wait for the farest peers
-            // Duration::ZERO..Duration::from_millis(20 * 1000),
-            Duration::from_millis(2 * 1000)..Duration::from_millis(20 * 1000),
+            Duration::ZERO..Duration::from_millis(20 * 1000),
+            // Duration::from_millis(2 * 1000)..Duration::from_millis(20 * 1000),
             // up to 20s random delay diff + up to 40s bootstrap latency
-            // Duration::from_millis(80 * 1000),
-            Duration::from_millis(60 * 1000),
+            Duration::from_millis(300 * 1000),
+            // Duration::from_millis(60 * 1000),
         ));
     }
 

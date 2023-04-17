@@ -448,10 +448,10 @@ fn main() {
         faulty_rate: 0.,
         object_count: 1,
 
-        chunk_n: 1,
-        chunk_k: 1,
-        fragment_n: 625,
-        fragment_k: 200,
+        chunk_n: 100,
+        chunk_k: 100,
+        fragment_n: 3,
+        fragment_k: 1,
         cache_sec: INDEFINITE, // traffic equivalent to always cache hit
         watermark_sec: INDEFINITE,
 
@@ -463,39 +463,39 @@ fn main() {
     let mut systems = Vec::new();
 
     // churn rate vs. repair traffic
-    let churn_rates = [0.00001, 1., 2., 3., 4., 5., 6., 7., 8.];
-    // kademlia
-    for churn_rate in churn_rates {
-        config.churn_rate = churn_rate;
-        systems.extend(
-            repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
-        );
-    }
-    // entropy
-    config = Config {
-        chunk_n: 100,
-        chunk_k: 80,
-        fragment_n: 500,
-        fragment_k: 200,
-        cache_sec: 0,
-        ..config
-    };
-    for cache_sec in [0, 6 * 3600, 12 * 3600, 24 * 3600, 48 * 3600] {
-        config.cache_sec = cache_sec;
-        for churn_rate in churn_rates {
-            config.churn_rate = churn_rate;
-            config.watermark_sec =
-                (365. * 86400. / config.churn_rate / config.fragment_n as f32) as _;
-            systems.extend(
-                repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
-            );
-        }
-    }
+    // let churn_rates = [0.00001, 1., 2., 3., 4., 5., 6., 7., 8.];
+    // // kademlia
+    // for churn_rate in churn_rates {
+    //     config.churn_rate = churn_rate;
+    //     systems.extend(
+    //         repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
+    //     );
+    // }
+    // // entropy
+    // config = Config {
+    //     chunk_n: 10,
+    //     chunk_k: 8,
+    //     fragment_n: 80,
+    //     fragment_k: 32,
+    //     cache_sec: 0,
+    //     ..config
+    // };
+    // for cache_sec in [0, 6 * 3600, 12 * 3600, 24 * 3600, 48 * 3600] {
+    //     config.cache_sec = cache_sec;
+    //     for churn_rate in churn_rates {
+    //         config.churn_rate = churn_rate;
+    //         config.watermark_sec =
+    //             (365. * 86400. / config.churn_rate / config.fragment_n as f32) as _;
+    //         systems.extend(
+    //             repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
+    //         );
+    //     }
+    // }
 
     // object count vs. repair traffic
     // config.churn_rate = 4.;
     // config.duration = 1;
-    // let object_counts = [1, 10, 100, 1000];
+    // let object_counts = [1, 10, 100, 1000, 10000];
     // // kademlia
     // for object_count in object_counts {
     //     config.object_count = object_count;
@@ -505,10 +505,10 @@ fn main() {
     // }
     // // entropy
     // config = Config {
-    //     chunk_n: 100,
-    //     chunk_k: 80,
-    //     fragment_n: 500,
-    //     fragment_k: 200,
+    //     chunk_n: 10,
+    //     chunk_k: 8,
+    //     fragment_n: 80,
+    //     fragment_k: 32,
     //     cache_sec: 0,
     //     ..config
     // };
@@ -535,15 +535,20 @@ fn main() {
     //     allow_data_lost: false,
     //     ..config
     // };
-    // config.watermark_sec = (365. * 86400. / config.churn_rate / config.fragment_n as f32 * config.faulty_rate) as _;
+    // config.watermark_sec = (365. * 86400. / config.churn_rate / config.fragment_n as f32
+    //     * (1. - config.faulty_rate)
+    //     * 0.5) as _;
+    // systems.push((config.clone(), StdRng::from_rng(&mut seeder).unwrap()));
+    // config.fragment_n = 100;
     // systems.push((config.clone(), StdRng::from_rng(&mut seeder).unwrap()));
 
     // faulty portion vs. data lost
     // config.churn_rate = 4.;
     // config.duration = 10;
-    // let faulty_rates = [0., 0.1, 0.2, 0.3, 0.4, 0.5];
+    // config.object_count = 100;
+    // let faulty_rates = Vec::from_iter((0..16).map(|i| i as f32 * 0.04));
     // // kademlia
-    // for faulty_rate in faulty_rates {
+    // for faulty_rate in faulty_rates.clone() {
     //     config.faulty_rate = faulty_rate;
     //     systems.extend(
     //         repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
@@ -558,11 +563,13 @@ fn main() {
     //     cache_sec: 0,
     //     ..config
     // };
-    // config.watermark_sec = (365. * 86400. / config.churn_rate / config.fragment_n as f32) as _;
     // for fragment_n in [80, 100, 120] {
     //     config.fragment_n = fragment_n;
-    //     for faulty_rate in faulty_rates {
+    //     for faulty_rate in faulty_rates.clone() {
     //         config.faulty_rate = faulty_rate;
+    //         config.watermark_sec = (365. * 86400. / config.churn_rate / (config.fragment_n as f32)
+    //             * (1. - config.faulty_rate)
+    //             * 0.5) as _;
     //         systems.extend(
     //             repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
     //         );
@@ -570,35 +577,38 @@ fn main() {
     // }
 
     // targeted node count vs. data lost
-    // config.churn_rate = 4.;
-    // config.duration = 10;
-    // let targeted_counts = [10, 20, 30, 40, 50];
-    // // kademlia
-    // for targeted_count in targeted_counts {
-    //     config.targeted_count = targeted_count;
-    //     systems.extend(
-    //         repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
-    //     );
-    // }
-    // // entropy
-    // config = Config {
-    //     chunk_n: 10,
-    //     chunk_k: 8,
-    //     fragment_n: 80,
-    //     fragment_k: 32,
-    //     cache_sec: 0,
-    //     ..config
-    // };
-    // config.watermark_sec = (365. * 86400. / config.churn_rate / config.fragment_n as f32) as _;
-    // for chunk_n in [8, 10, 12] {
-    //     config.chunk_n = chunk_n;
-    //     for targeted_count in targeted_counts {
-    //         config.targeted_count = targeted_count;
-    //         systems.extend(
-    //             repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
-    //         );
-    //     }
-    // }
+    config.churn_rate = 4.;
+    config.duration = 10;
+    config.object_count = 100;
+    let targeted_counts = Vec::from_iter((0..20).map(|i| i * 50));
+    // kademlia
+    for targeted_count in targeted_counts.clone() {
+        config.targeted_count = targeted_count;
+        systems.extend(
+            repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
+        );
+    }
+    // entropy
+    config = Config {
+        chunk_n: 10,
+        chunk_k: 8,
+        fragment_n: 80,
+        fragment_k: 32,
+        cache_sec: 0,
+        ..config
+    };
+    config.watermark_sec = (365. * 86400. / config.churn_rate / config.fragment_n as f32
+        * (1. - config.faulty_rate)
+        * 0.5) as _;
+    for chunk_n in [10, 12, 14] {
+        config.chunk_n = chunk_n;
+        for targeted_count in targeted_counts.clone() {
+            config.targeted_count = targeted_count;
+            systems.extend(
+                repeat_with(|| (config.clone(), StdRng::from_rng(&mut seeder).unwrap())).take(10),
+            );
+        }
+    }
 
     println!(
         "churn_rate,node_count,duration,faulty_rate,object_count,chunk_n,chunk_k,\
@@ -609,7 +619,7 @@ fn main() {
         eprintln!("{config:?}");
         let mut system = System::new(config, &mut rng);
         // time vs. faulty portion
-        system.insert_event(12 * 3600, Event::Report);
+        // system.insert_event(12 * 3600, Event::Report);
         system.run(rng);
         eprintln!("{:?}", system.stats);
     })

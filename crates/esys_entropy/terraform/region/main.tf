@@ -74,7 +74,7 @@ data "aws_ami" "ubuntu" {
 
 variable "instance_type" {
   type    = string
-  default = "c5.9xlarge"
+  default = "r5.8xlarge"
 }
 
 variable "instance_count" {
