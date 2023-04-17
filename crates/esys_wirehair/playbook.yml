@@ -15,7 +15,7 @@
     ansible.builtin.shell: ./coding_bench > coding-time.csv
   - name: Fetch Result
     ansible.builtin.fetch:
-      src: "{{ prefix }}.csv"
+      src: "coding-time.csv"
       dest: "../../coding-time_{{ ansible_date_time.epoch }}"
   - name: Clean Remote
     ansible.builtin.file:

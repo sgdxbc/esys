@@ -6,8 +6,10 @@ use rand::{random, thread_rng, RngCore};
 
 const OBJECT_SIZE: usize = 1 << 30;
 fn main() {
-    let outer_codings = [(4, 5), (8, 10), (12, 15)];
-    let inner_codings = [(32, 80)];
+    // let outer_codings = [(4, 5), (8, 10), (12, 15)];
+    // let inner_codings = [(32, 80)];
+    let outer_codings = [(8, 10)];
+    let inner_codings = [(16, 40), (32, 80), (48, 120)];
 
     println!("chunk_k,chunk_n,fragment_k,fragment_n,op,time");
     for (chunk_k, chunk_n) in outer_codings {
