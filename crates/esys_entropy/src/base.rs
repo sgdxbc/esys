@@ -140,15 +140,15 @@ impl Base {
 
 impl BaseHandle {
     pub fn ingress(&self, action: impl FnOnce(&mut Swarm<Base>) + Send + Sync + 'static) {
-        // if
-        self.ingress
+        if self
+            .ingress
             .send(Box::new(|swarm, _| action(swarm)))
-            .map_err(|_| ())
-            .unwrap();
-        //     .is_err()
-        // {
-        //     tracing::warn!("fail to ingress");
-        // }
+            // .map_err(|_| ())
+            // .unwrap();
+            .is_err()
+        {
+            tracing::warn!("fail to ingress");
+        }
     }
 
     pub fn ingress_wait<T: Send + 'static>(
@@ -507,14 +507,10 @@ impl BaseHandle {
 
     pub fn response_ok(&self, channel: ResponseChannel<crate::rpc::proto::Response>) {
         self.ingress(move |swarm| {
-            swarm
-                .behaviour_mut()
-                .rpc
-                .send_response(
-                    channel,
-                    crate::rpc::proto::Response::from(crate::rpc::proto::Ok {}),
-                )
-                .unwrap()
+            let _ = swarm.behaviour_mut().rpc.send_response(
+                channel,
+                crate::rpc::proto::Response::from(crate::rpc::proto::Ok {}),
+            );
         })
     }
 }

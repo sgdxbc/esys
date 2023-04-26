@@ -1,0 +1,11 @@
+---
+- hosts: client
+  tasks:
+  - ansible.builtin.shell: >
+      ./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} --put > latency.csv
+  - ansible.builtin.fetch:
+      src: "latency.csv"
+      dest: "../../../client-latency_{{ count }}"
+  - ansible.builtin.file:
+      path: "latency.csv"
+      state: absent

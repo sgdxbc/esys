@@ -37,14 +37,31 @@ provider "aws" {
   region = "af-south-1"
 }
 
+provider "aws" {
+  alias = "client"
+  region = "ap-southeast-1"
+  profile = "prof"
+}
+
 module "service" {
   source = "./region"
   providers = {
-    aws = aws.ap-southeast-1
+    # aws = aws.ap-southeast-1
+    aws = aws.ap-east-1
   }
 
   instance_type  = "m5.2xlarge"
   instance_count = 1
+}
+
+module "client" {
+  source = "./region"
+  providers = {
+    aws = aws.client
+  }
+
+  instance_type  = "m5.2xlarge"
+  instance_count = 100
 }
 
 module "region-1" {
@@ -122,12 +139,13 @@ module "region-5" {
 resource "local_file" "inventory" {
   content = templatefile(
     "${path.module}/inventory.ini.tftpl", {
-      service       = module.service.instances,
-      region-1      = module.region-1.instances,
-      region-2      = module.region-2.instances,
-      region-3      = module.region-3.instances,
-      region-4      = module.region-4.instances,
-      region-5      = module.region-5.instances,
+      service  = module.service.instances,
+      region-1 = module.region-1.instances,
+      region-2 = module.region-2.instances,
+      region-3 = module.region-3.instances,
+      region-4 = module.region-4.instances,
+      region-5 = module.region-5.instances,
+      client = module.client.instances,
   })
   filename = "${path.module}/inventory.ini"
 }

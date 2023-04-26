@@ -3,7 +3,6 @@ use std::{collections::HashMap, time::Instant};
 use esys_wirehair::{WirehairDecoder, WirehairEncoder};
 use rand::{random, thread_rng, RngCore};
 
-
 const OBJECT_SIZE: usize = 1 << 30;
 fn main() {
     // let outer_codings = [(4, 5), (8, 10), (12, 15)];

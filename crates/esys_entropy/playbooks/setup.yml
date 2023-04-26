@@ -11,29 +11,30 @@
       src: ../../../target/release/esys_entropy
       dest: .
       mode: preserve
-  - name: Increase file descriptor limit
-    become: yes
-    become_user: root
-    community.general.pam_limits:
-      domain: ubuntu
-      limit_type: soft
-      limit_item: nofile
-      value: 1048576
-- name: Start Service Peer
-  hosts: service
-  tasks:
-  - ansible.builtin.shell: >
-      tmux new-session -d -s esys 
-      "./esys_entropy --ip {{ inventory_hostname }} --bootstrap-service || read _"
-- name: Start Normal Peers
-  hosts: normal
-  tasks:
-  - ansible.builtin.shell: >
-      tmux new-session -d -s esys 
-      "./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 400 || read _"
-  # - ansible.builtin.shell: >
-  #     tmux new-session -d -s esys 
-  #     "./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 400 
-  #     --expected-churn-interval 10 || read _"
-    environment:
-      RUST_LOG: esys_entropy=info
+#   - name: Increase file descriptor limit
+#     become: yes
+#     become_user: root
+#     community.general.pam_limits:
+#       domain: ubuntu
+#       limit_type: soft
+#       limit_item: nofile
+#       value: 1048576
+# - name: Start Service Peer
+#   hosts: service
+#   tasks:
+#   - ansible.builtin.shell: >
+#       tmux new-session -d -s esys 
+#       "./esys_entropy --ip {{ inventory_hostname }} --bootstrap-service || read _"
+# - name: Start Normal Peers
+#   hosts: normal
+#   tasks:
+#   - ansible.builtin.shell: >
+#       tmux new-session -d -s esys 
+#       "./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 400 || read _"
+#   # - ansible.builtin.shell: >
+#   #     tmux new-session -d -s esys 
+#   #     "./esys_entropy --ip {{ inventory_hostname }} --service-ip {{ groups['service'][0] }} -n 80
+#   #     --chunk-n 2 --chunk-k 2 --fragment-n 40 --fragment-k 16
+#   #     --expected-churn-interval 10 || read _"
+#     environment:
+#       RUST_LOG: esys_entropy=info

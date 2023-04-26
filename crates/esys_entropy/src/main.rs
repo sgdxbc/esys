@@ -1,10 +1,11 @@
 use std::{
+    io::stderr,
     mem::take,
     net::Ipv4Addr,
     ops::{ControlFlow, Range},
     pin::pin,
     sync::Arc,
-    time::{Duration, Instant}, io::stderr,
+    time::{Duration, Instant},
 };
 
 use clap::Parser;
@@ -121,6 +122,8 @@ async fn main() {
         println!("protocol,chunk_k,chunk_n,fragment_k,fragment_n,op,latency");
 
         for _ in 0..cli.repeat {
+            // sleep(thread_rng().gen_range(Duration::ZERO..Duration::from_millis(10 * 1000))).await;
+
             let base = init_base(
                 start_base(&cli, "put").await,
                 Duration::ZERO..Duration::from_millis(1),
@@ -234,8 +237,10 @@ async fn main() {
             let put_latency = Instant::now() - put_start;
 
             if !cli.kademlia {
+                // sleep(Duration::from_secs(50)).await; // so putter have sent out all fragments
                 sleep(Duration::from_secs(5)).await; // so putter have sent out all fragments
             }
+            // return;
             let base = init_base(
                 start_base(&cli, "get").await,
                 Duration::ZERO..Duration::from_millis(1),
@@ -436,23 +441,19 @@ async fn main() {
     let (mut inbound, mut outbound) = (0, 0);
     let mut replace_count = 0;
 
+    let mut churn_delay = Box::pin(sleep(if cli.expected_churn_interval.is_some() {
+        // keep system stable until data inserted
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(86400)
+    }));
     loop {
-        let mut churn_delay =
-            Box::pin(sleep(if let Some(interval) = cli.expected_churn_interval {
-                Duration::from_secs_f64(
-                    Poisson::new(interval as f64)
-                        .unwrap()
-                        .sample(&mut thread_rng()),
-                )
-            } else {
-                Duration::from_secs(86400)
-            }));
         select! {
             result = ctrl_c() => {
                 result.unwrap();
                 break;
             }
-            _ = churn_delay => {
+            _ = &mut churn_delay => {
                 async {
                     let index = thread_rng().gen_range(0..cli.n);
                     let instance = instances.swap_remove(index);
@@ -480,11 +481,13 @@ async fn main() {
                 .instrument(info_span!("churn"))
                 .await;
 
-                churn_delay = Box::pin(sleep(Duration::from_secs_f64(
+                let churn_interval = Duration::from_secs_f64(
                     Poisson::new(cli.expected_churn_interval.unwrap() as f64)
                         .unwrap()
                         .sample(&mut thread_rng()),
-                )));
+                );
+                tracing::info!("next churn in {churn_interval:?}");
+                churn_delay.as_mut().reset(tokio::time::Instant::now() + churn_interval);
                 tracing::trace!(?churn_delay); // to disable false positive unused assignment
             }
         }
@@ -494,8 +497,16 @@ async fn main() {
         outbound += instance.bandwidth.total_outbound();
     }
     fs::write(
-        "bandwidth.txt",
-        format!("{},{}\n", inbound - inbound_zero, outbound - outbound_zero),
+        "traffic.csv",
+        format!(
+            "inbound,outbound,time\n{},{},{}\n",
+            inbound - inbound_zero,
+            outbound - outbound_zero,
+            Duration::from(
+                nix::time::clock_gettime(nix::time::ClockId::CLOCK_PROCESS_CPUTIME_ID).unwrap()
+            )
+            .as_secs_f32()
+        ),
     )
     .await
     .unwrap();

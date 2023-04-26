@@ -19,3 +19,8 @@ ${ip} ansible_host=${host}
 %{ for ip, host in region-5}
 ${ip} ansible_host=${host}
 %{ endfor ~}
+
+[client]
+%{ for ip, host in client}
+${ip} ansible_host=${host}
+%{ endfor ~}

@@ -1,0 +1,11 @@
+---
+- hosts: normal
+  tasks:
+  - name: Gather Result
+    ansible.builtin.fetch:
+      src: "traffic.csv"
+      dest: "../../../coding-traffic/{{ setup }}"
+  - name: Clean Remote
+    ansible.builtin.file:
+      path: "traffic.csv"
+      state: absent

@@ -335,6 +335,7 @@ impl App {
         let prev_index = chunk.index;
         // add some backup invitations to make sure success in the first try
         chunk.index += (((self.config.fragment_n - chunk.indexes.len()) as f32) * 2.) as u32;
+        // chunk.index += (((self.config.fragment_n - chunk.indexes.len()) as f32) * 1.2) as u32;
         // chunk.index += (self.config.fragment_n - chunk.indexes.len()) as u32;
         // doing eval in a good network so skip retry old indexes
         tracing::debug!(index = ?(prev_index..chunk.index), "invite chunk {chunk_hash:02x?}");
@@ -449,11 +450,7 @@ impl App {
                         init_members: members.clone(),
                     });
                     base.ingress(move |swarm| {
-                        swarm
-                            .behaviour_mut()
-                            .rpc
-                            .send_response(channel, response)
-                            .unwrap();
+                        let _ = swarm.behaviour_mut().rpc.send_response(channel, response);
                     });
                 });
             }
@@ -581,23 +578,26 @@ impl App {
             return;
         };
         // can it get larger then n?
-        if chunk.fragment_count() >= self.config.fragment_n {
-            tracing::debug!("finish invite for healthy chunk {chunk_hash:02x?}");
-            return;
-        }
+        // if chunk.fragment_count() >= self.config.fragment_n {
+        //     tracing::debug!("finish invite for healthy chunk {chunk_hash:02x?}");
+        //     return;
+        // }
 
         // assume no more node below high watermark is avaiable i.e. can be successfully invited any more
-        chunk.high_watermark += (self.config.fragment_n - chunk.fragment_count()) as u32;
+        // chunk.high_watermark += (self.config.fragment_n - chunk.fragment_count()) as u32;
+        // TODO
+
         let invite_indexes = Vec::from_iter(
             // not use `chunk.watermark()` to because that is for passively accepting, while this is actively inviting
             (chunk.low_watermark(&self.config)..=chunk.high_watermark)
                 .filter(|index| !chunk.indexes.contains_key(index)),
         );
+
         tracing::info!("invite chunk {chunk_hash:02x?} indexes {invite_indexes:?}");
         for index in invite_indexes {
             self.invite_index(chunk_hash, index);
         }
-        self.set_timer(self.config.invite_interval, AppEvent::Invite(*chunk_hash));
+        // self.set_timer(self.config.invite_interval, AppEvent::Invite(*chunk_hash));
     }
 
     fn gossip(&self, chunk_hash: &Multihash) {
@@ -605,6 +605,12 @@ impl App {
             // e.g. go below low watermark and get removed in membership timer
             return;
         };
+        // assert!(matches!(chunk.fragment, Fragment::Complete(_)));
+        if matches!(chunk.fragment, Fragment::Incomplete(_)) {
+            tracing::debug!("cancel gossip for re-joining group");
+            return;
+        }
+
         let request = proto::Request::from(proto::Gossip {
             chunk_hash: chunk_hash.to_bytes(),
             fragment_index: chunk.fragment_index,
@@ -756,9 +762,10 @@ impl App {
             "invited chunk {chunk_hash:02x?} index {}",
             message.fragment_index
         );
-        if self.chunks.contains_key(&chunk_hash) {
+
+        if let Some(_chunk) = self.chunks.get_mut(&chunk_hash) {
             tracing::debug!("deplicated invitation chunk {chunk_hash:02x?}");
-            return; // need merge?
+            return;
         }
 
         let Some(proof) = self.prove(&chunk_hash, message.fragment_index) else {
@@ -864,11 +871,10 @@ impl App {
                 init_members: Default::default(), // not used
             });
             self.base.ingress(move |swarm| {
-                swarm
+                let _ = swarm
                     .behaviour_mut()
                     .rpc
-                    .send_response(channel, response)
-                    .unwrap();
+                    .send_response(channel, response);
             });
             return;
         };
@@ -887,7 +893,10 @@ impl App {
         );
 
         let Fragment::Complete(fragment) = &chunk.fragment else {
-            panic!("receive query fragment before sending gossip")
+            // panic!("receive query fragment before sending gossip")
+            // possibly happen when re-joining a group
+            self.base.response_ok(channel);
+            return;
         };
         let Some(local_member) = chunk.members.get(&PeerId::from_public_key(&self.keypair.public())) else {
             //
@@ -906,11 +915,7 @@ impl App {
             init_members: Default::default(), // not used
         });
         self.base.ingress(move |swarm| {
-            swarm
-                .behaviour_mut()
-                .rpc
-                .send_response(channel, response)
-                .unwrap();
+            let _ = swarm.behaviour_mut().rpc.send_response(channel, response);
         });
     }
 
@@ -1029,11 +1034,7 @@ impl App {
             )),
         });
         self.base.ingress(move |swarm| {
-            swarm
-                .behaviour_mut()
-                .rpc
-                .send_response(channel, response)
-                .unwrap();
+            let _ = swarm.behaviour_mut().rpc.send_response(channel, response);
         });
     }
 
